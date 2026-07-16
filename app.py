@@ -40,8 +40,20 @@ def parse_date_time(date_str, time_str):
         return None
     date_str = str(date_str).strip()
     time_str = str(time_str).strip() if time_str else ""
+
     try:
+        # Dialogflow шлёт ISO 8601: 2026-12-12T12:00:00+05:00
+        if 'T' in date_str:
+            # Убираем timezone (+05:00 или Z)
+            dt_str = date_str.split('+')[0].split('Z')[0]
+            return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+
         if time_str:
+            # Dialogflow time тоже может быть в ISO: 2026-07-17T12:30:00+05:00
+            if 'T' in time_str:
+                dt_str = time_str.split('+')[0].split('Z')[0]
+                return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+
             dt_str = f"{date_str} {time_str}"
             for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m.%y %H:%M"]:
                 try:
@@ -54,8 +66,8 @@ def parse_date_time(date_str, time_str):
                     return datetime.strptime(date_str, fmt)
                 except ValueError:
                     continue
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Parse error: {e} for date={date_str}, time={time_str}")
     return None
 
 def parse_from_text(text):
@@ -346,8 +358,6 @@ def handle_reminder(params, query_text, chat_id, all_required_present):
     # Если Dialogflow ещё собирает параметры (slot filling) — не создаём событие
     if not all_required_present:
         logger.info("Slot filling in progress, not creating event yet")
-        # Dialogflow сам спросит следующий параметр через Prompts
-        # Мы просто возвращаем пустой ответ, чтобы Dialogflow продолжил
         return jsonify({"fulfillmentText": ""})
 
     # Все параметры собраны — создаём событие
