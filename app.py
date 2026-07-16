@@ -343,13 +343,21 @@ def handle_greeting(chat_id):
 def handle_reminder(params, query_text, chat_id, all_required_present):
     """
     Обрабатывает создание события.
-    Работает и с полными параметрами, и с slot filling.
+    Если all_required_present=False — значит Dialogflow ещё спрашивает параметры.
+    Не создаём событие, а просто подтверждаем получение.
     """
-    # Пробуем получить из параметров Dialogflow
+    # Если Dialogflow ещё собирает параметры (slot filling) — не создаём событие
+    if not all_required_present:
+        logger.info("Slot filling in progress, not creating event yet")
+        # Dialogflow сам спросит следующий параметр через Prompts
+        # Мы просто возвращаем пустой ответ, чтобы Dialogflow продолжил
+        return jsonify({"fulfillmentText": ""})
+
+    # Все параметры собраны — создаём событие
     name = get_param(params, "name")
     start_dt = extract_datetime(params, "date", "time")
 
-    # Если параметров не хватает — парсим из текста
+    # Fallback: парсим из текста, если параметры кривые
     if not name or not start_dt:
         parsed_name, parsed_dt = parse_event_from_text(query_text)
         if parsed_name and not name:
@@ -357,14 +365,10 @@ def handle_reminder(params, query_text, chat_id, all_required_present):
         if parsed_dt and not start_dt:
             start_dt = parsed_dt
 
-    # Если всё ещё не хватает — просим указать
+    # Если всё ещё не хватает — ошибка
     if not name or not start_dt:
-        missing = []
-        if not name: missing.append("название")
-        if not start_dt: missing.append("дату и время")
-
-        logger.info(f"Slot filling: missing {missing}")
-        return jsonify({"fulfillmentText": f"Укажите {', '.join(missing)} начала события."})
+        logger.warning(f"Missing params after slot filling: name={name}, start_dt={start_dt}")
+        return jsonify({"fulfillmentText": "Не удалось распознать данные. Попробуйте ещё раз."})
 
     # Парсим дату окончания из текста
     end_dt = None
@@ -407,6 +411,11 @@ def handle_olympiad(params, query_text, chat_id, all_required_present):
     """
     Обрабатывает создание олимпиады.
     """
+    # Если Dialogflow ещё собирает параметры — не создаём
+    if not all_required_present:
+        logger.info("Olympiad slot filling in progress")
+        return jsonify({"fulfillmentText": ""})
+
     # Пробуем получить из параметров Dialogflow
     name = get_param(params, "any")
     subject = get_param(params, "subject")
@@ -417,7 +426,7 @@ def handle_olympiad(params, query_text, chat_id, all_required_present):
     start_dt = parse_date_time(start_date, None) if start_date else None
     end_dt = parse_date_time(end_date, None) if end_date else None
 
-    # Если не хватает — парсим из текста
+    # Fallback: парсим из текста
     if not name or not start_dt or not end_dt or not subject or not level:
         p_name, p_start, p_end, p_subj, p_lvl = parse_olympiad_from_text(query_text)
         if p_name and not name: name = p_name
@@ -441,7 +450,7 @@ def handle_olympiad(params, query_text, chat_id, all_required_present):
         if not subject: missing.append("предмет")
         if not level: missing.append("уровень")
 
-        logger.info(f"Olympiad slot filling: missing {missing}")
+        logger.info(f"Olympiad missing: {missing}")
         return jsonify({"fulfillmentText": f"Укажите {', '.join(missing)} олимпиады."})
 
     job_ids = schedule_reminders(chat_id, "olympiad", name, start_dt, end_dt, subject, level)
