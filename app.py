@@ -39,47 +39,45 @@ scheduler = BackgroundScheduler(timezone=UTC)
 scheduler.start()
 
 # ===================== DATE/TIME PARSER =====================
-def parse_date_time(date_str, time_str, timezone_offset="+05:00"):
-    """Собирает datetime из date и time от Dialogflow с учётом часового пояса."""
+def parse_date_time(date_str, time_str):
+    """Собирает datetime из date и time от Dialogflow с учётом часового пояса.
+
+    Извлекает дату из date_str и время из time_str отдельно, чтобы избежать
+    конфликтов, когда Dialogflow добавляет дефолтное время к дате.
+    """
     if not date_str:
         return None
     date_str = str(date_str).strip()
     time_str = str(time_str).strip() if time_str else ""
 
     try:
-        # Dialogflow шлёт ISO 8601: 2026-12-12T12:00:00+05:00
+        # Извлекаем дату (YYYY-MM-DD) из date_str
         if 'T' in date_str:
-            # Убираем timezone (+05:00 или Z)
-            dt_str = date_str.split('+')[0].split('Z')[0]
+            date_part = date_str.split('T')[0]
+        else:
+            date_part = date_str
+
+        # Извлекаем время (HH:MM:SS) из time_str
+        time_part = None
+        if time_str:
+            if 'T' in time_str:
+                # Формат: 2026-07-17T03:34:00+05:00 → берём 03:34:00
+                time_part = time_str.split('T')[1].split('+')[0].split('Z')[0]
+            else:
+                time_part = time_str
+
+        if time_part:
+            # Склеиваем дату и время
+            dt_str = f"{date_part}T{time_part}"
             dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
-            # Применяем часовой пояс пользователя
+            dt = USER_TIMEZONE.localize(dt)
+            return dt
+        else:
+            # Только дата, без времени
+            dt = datetime.strptime(date_part, "%Y-%m-%d")
             dt = USER_TIMEZONE.localize(dt)
             return dt
 
-        if time_str:
-            # Dialogflow time тоже может быть в ISO: 2026-07-17T14:44:00+05:00
-            if 'T' in time_str:
-                dt_str = time_str.split('+')[0].split('Z')[0]
-                dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
-                dt = USER_TIMEZONE.localize(dt)
-                return dt
-
-            dt_str = f"{date_str} {time_str}"
-            for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m.%y %H:%M"]:
-                try:
-                    dt = datetime.strptime(dt_str, fmt)
-                    dt = USER_TIMEZONE.localize(dt)
-                    return dt
-                except ValueError:
-                    continue
-        else:
-            for fmt in ["%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"]:
-                try:
-                    dt = datetime.strptime(date_str, fmt)
-                    dt = USER_TIMEZONE.localize(dt)
-                    return dt
-                except ValueError:
-                    continue
     except Exception as e:
         logger.error(f"Parse error: {e} for date={date_str}, time={time_str}")
     return None
