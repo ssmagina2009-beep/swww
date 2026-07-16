@@ -14,9 +14,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TOKEN = "YOUR_BOT_TOKEN"
 
-scheduler = AsyncIOScheduler()
-
 DB = "events.db"
+
+scheduler = AsyncIOScheduler()
 
 
 # ---------- БАЗА ДАННЫХ ----------
@@ -43,7 +43,6 @@ def init_db():
 
 
 def save_event(data):
-
     conn = sqlite3.connect(DB)
     cursor = conn.cursor()
 
@@ -57,33 +56,13 @@ def save_event(data):
     conn.close()
 
 
-
-def get_events(chat_id):
-
-    conn = sqlite3.connect(DB)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT * FROM events WHERE chat_id=?",
-        (chat_id,)
-    )
-
-    result = cursor.fetchall()
-
-    conn.close()
-
-    return result
-
-
-
 def delete_event(chat_id, title, start):
-
     conn = sqlite3.connect(DB)
     cursor = conn.cursor()
 
     cursor.execute("""
     DELETE FROM events
-    WHERE chat_id=? 
+    WHERE chat_id=?
     AND title=?
     AND start=?
     """,
@@ -93,13 +72,12 @@ def delete_event(chat_id, title, start):
         start
     ))
 
-    deleted = cursor.rowcount
+    result = cursor.rowcount
 
     conn.commit()
     conn.close()
 
-    return deleted > 0
-
+    return result > 0
 
 
 # ---------- НАПОМИНАНИЯ ----------
@@ -116,27 +94,29 @@ async def send_reminder(
         hours
 ):
 
+    if hours == 0:
+        prefix = "Сейчас начинается"
+    else:
+        prefix = f"Через {hours} часов будет"
+
     if event_type == "напоминание":
 
         text = (
-            f"Напоминание! Через {hours} часов будет событие "
-            f"«{title}» с {start} по {end}❤️"
+            f"{prefix} событие "
+            f"«{title}»\n"
+            f"Начало: {start}\n"
+            f"Конец: {end}"
         )
 
     else:
 
         text = (
-            f"Напоминание! Через {hours} часов будет олимпиада "
-            f"«{title}» «{subject}» {level} уровня "
-            f"с {start} по {end}❤️"
-        )
-
-
-    if hours == 0:
-
-        text = text.replace(
-            "Через 0 часов будет",
-            "Сейчас начинается"
+            f"{prefix} олимпиада\n"
+            f"«{title}»\n"
+            f"Предмет: {subject}\n"
+            f"Уровень: {level}\n"
+            f"Начало: {start}\n"
+            f"Конец: {end}"
         )
 
 
@@ -158,10 +138,16 @@ def create_reminders(
         bot
 ):
 
-    start_date = datetime.strptime(
-        start,
-        "%d.%m.%Y %H:%M"
-    )
+    try:
+
+        start_date = datetime.strptime(
+            start,
+            "%d.%m.%Y %H:%M"
+        )
+
+    except:
+
+        return
 
 
     for hours in [168, 48, 24, 0]:
@@ -190,7 +176,7 @@ def create_reminders(
 
 
 
-# ---------- ОБРАБОТКА СООБЩЕНИЙ ----------
+# ---------- СООБЩЕНИЯ ----------
 
 
 async def message_handler(
@@ -202,11 +188,11 @@ async def message_handler(
 
     chat_id = update.effective_chat.id
 
-
     lower = text.lower()
 
 
-    # -------- ОТМЕНА --------
+
+    # ОТМЕНА
 
     if (
         "отмени" in lower
@@ -220,7 +206,6 @@ async def message_handler(
         if len(lines) >= 3:
 
             title = lines[1]
-
             start = lines[2]
 
 
@@ -231,10 +216,11 @@ async def message_handler(
             ):
 
                 await update.message.reply_text(
-                    f"Удалил «{title}»❤️"
+                    f"Удалил событие «{title}»"
                 )
 
             else:
+
                 await update.message.reply_text(
                     "Не нашел такое событие"
                 )
@@ -243,14 +229,13 @@ async def message_handler(
 
 
 
-    # -------- НАПОМИНАНИЕ --------
+    # НАПОМИНАНИЕ
 
 
     if "напоминание" in lower:
 
+
         lines = text.split("\n")
-
-
         if len(lines) != 4:
 
             await update.message.reply_text(
@@ -262,7 +247,6 @@ async def message_handler(
             )
 
             return
-
 
 
         title = lines[1]
@@ -297,12 +281,12 @@ async def message_handler(
 
         await update.message.reply_text(
             f"Добавлено новое событие "
-            f"«{title}» с {start} по {end}❤️"
+            f"«{title}» с {start} по {end}"
         )
 
 
 
-    # -------- ОЛИМПИАДА --------
+    # ОЛИМПИАДА
 
 
     elif "олимпиада" in lower:
@@ -363,10 +347,10 @@ async def message_handler(
 
 
         await update.message.reply_text(
-            f"Добавлена новая олимпиада "
-            f"«{title}» «{subject}» "
-            f"{level} уровня "
-            f"с {start} по {end}❤️"
+            f"Добавлена олимпиада "
+            f"«{title}» {subject}, "
+            f"{level} уровень\n"
+            f"{start} - {end}"
         )
 
 
@@ -374,13 +358,23 @@ async def message_handler(
 # ---------- ЗАПУСК ----------
 
 
+async def post_init(app):
+
+    scheduler.start()
+
+
+
 def main():
 
     init_db()
 
-    app = ApplicationBuilder()\
-        .token(TOKEN)\
+
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(post_init)
         .build()
+    )
 
 
     app.add_handler(
@@ -389,9 +383,6 @@ def main():
             message_handler
         )
     )
-
-
-    scheduler.start()
 
 
     app.run_polling()
