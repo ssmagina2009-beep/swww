@@ -176,16 +176,88 @@ def extract_datetime(params, date_key, time_key):
         return parse_date_time(d, t)
     return None
 
+# ===================== PARSER FROM TEXT =====================
+def parse_event_from_text(text):
+    """Парсит название, дату и время из текста сообщения."""
+    # Убираем ключевые слова
+    cleaned = re.sub(r'^(создать|сделать|создай|сделай|напоминание|событие|event|reminder)\s+', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+(создать|сделать|создай|сделай|напоминание|событие|event|reminder)\s+', ' ', cleaned, flags=re.IGNORECASE)
+
+    # Ищем дату и время
+    date_patterns = [
+        r'(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})',
+        r'(\d{1,2}\.\d{1,2}\.\d{2})\s+(\d{1,2}:\d{2})',
+        r'(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})',
+        r'(\d{1,2}\/\d{1,2}\/\d{4})\s+(\d{1,2}:\d{2})',
+        r'(\d{1,2}\.\d{1,2}\.\d{4})',
+        r'(\d{1,2}\.\d{1,2}\.\d{2})',
+        r'(\d{4}-\d{2}-\d{2})',
+    ]
+
+    start_dt = None
+    title = cleaned.strip()
+
+    for pattern in date_patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            if len(match.groups()) == 2:
+                start_dt = parse_date_time(match.group(1), match.group(2))
+            else:
+                start_dt = parse_date_time(match.group(1), None)
+
+            if start_dt:
+                title = cleaned[:match.start()].strip()
+                break
+
+    return title, start_dt
+
+def parse_olympiad_from_text(text):
+    """Парсит олимпиаду из текста: название, дата_начала, дата_конца, предмет, уровень."""
+    cleaned = re.sub(r'^олимпиада\s+', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+олимпиада\s+', ' ', cleaned, flags=re.IGNORECASE)
+
+    date_pattern = r'(\d{1,2}\.\d{1,2}\.\d{4})'
+    dates = re.findall(date_pattern, cleaned)
+
+    start_dt = parse_date_time(dates[0], None) if len(dates) > 0 else None
+    end_dt = parse_date_time(dates[1], None) if len(dates) > 1 else None
+
+    # Убираем даты из текста
+    temp_text = re.sub(date_pattern, '', cleaned, count=2)
+    parts = [p.strip() for p in temp_text.split() if p.strip()]
+
+    level = None
+    if parts and parts[-1] in ['1', '2', '3']:
+        level = parts[-1]
+        parts = parts[:-1]
+
+    subject = ""
+    if parts:
+        subject = parts[-1]
+        parts = parts[:-1]
+
+    title = ' '.join(parts) if parts else "Олимпиада"
+
+    return title, start_dt, end_dt, subject, level
+
 # ===================== WEBHOOK =====================
+@app.route('/render', methods=['POST'])
+def render_webhook():
+    """Обработчик для Dialogflow, если URL указан как /render"""
+    return webhook()
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     req = request.get_json(silent=True, force=True)
     logger.info(f"=== WEBHOOK RECEIVED ===")
-    logger.info(json.dumps(req, ensure_ascii=False, indent=2)[:800])
+    logger.info(json.dumps(req, ensure_ascii=False, indent=2)[:1000])
 
     intent_name = req.get("queryResult", {}).get("intent", {}).get("displayName", "").lower()
     params = req.get("queryResult", {}).get("parameters", {})
     query_text = req.get("queryResult", {}).get("queryText", "")
+
+    # Проверяем, все ли параметры собраны (для slot filling)
+    all_required_present = req.get("queryResult", {}).get("allRequiredParamsPresent", False)
 
     # Получаем chat_id
     output_contexts = req.get("queryResult", {}).get("outputContexts", [])
@@ -201,9 +273,8 @@ def webhook():
 
     # Fallback: originalDetectIntentRequest
     if not chat_id:
-        orig = req.get("originalDetectIntentRequest", {})
-        payload = orig.get("payload", {})
-        telegram_data = payload.get("data", {})
+        orig = req.get("originalDetectIntentRequest", {}).get("payload", {})
+        telegram_data = orig.get("data", {})
         if "message" in telegram_data:
             chat_id = telegram_data["message"]["chat"]["id"]
         elif "callback_query" in telegram_data:
@@ -225,6 +296,8 @@ def webhook():
         pass
 
     logger.info(f"Intent: {intent_name}, ChatID: {chat_id}, Query: {query_text}")
+    logger.info(f"Params: {json.dumps(params, ensure_ascii=False)}")
+    logger.info(f"allRequiredParamsPresent: {all_required_present}")
 
     # --- GREETING / START ---
     if "privet" in intent_name or "start" in intent_name or "hello" in intent_name or "greeting" in intent_name or "welcome" in intent_name:
@@ -232,11 +305,11 @@ def webhook():
 
     # --- REMINDER / EVENT ---
     if "napomin" in intent_name or "reminder" in intent_name or "sobytie" in intent_name or "event" in intent_name:
-        return handle_reminder(params, query_text, chat_id)
+        return handle_reminder(params, query_text, chat_id, all_required_present)
 
     # --- OLYMPIAD ---
     elif "olimpiad" in intent_name or "olympiad" in intent_name:
-        return handle_olympiad(params, query_text, chat_id)
+        return handle_olympiad(params, query_text, chat_id, all_required_present)
 
     # --- CANCEL / DELETE ---
     elif "otmen" in intent_name or "cancel" in intent_name or "delete" in intent_name or "udal" in intent_name:
@@ -267,17 +340,33 @@ def handle_greeting(chat_id):
     send_telegram_message(chat_id, welcome_text, get_main_keyboard())
     return jsonify({"fulfillmentText": "Привет! Я показал меню с кнопками."})
 
-def handle_reminder(params, query_text, chat_id):
+def handle_reminder(params, query_text, chat_id, all_required_present):
     """
-    Параметры Dialogflow:
-    - name: @sys.any (название события)
-    - date: @sys.date (дата начала)
-    - time: @sys.time (время начала)
+    Обрабатывает создание события.
+    Работает и с полными параметрами, и с slot filling.
     """
+    # Пробуем получить из параметров Dialogflow
     name = get_param(params, "name")
     start_dt = extract_datetime(params, "date", "time")
 
-    # Парсим дату окончания из текста запроса
+    # Если параметров не хватает — парсим из текста
+    if not name or not start_dt:
+        parsed_name, parsed_dt = parse_event_from_text(query_text)
+        if parsed_name and not name:
+            name = parsed_name
+        if parsed_dt and not start_dt:
+            start_dt = parsed_dt
+
+    # Если всё ещё не хватает — просим указать
+    if not name or not start_dt:
+        missing = []
+        if not name: missing.append("название")
+        if not start_dt: missing.append("дату и время")
+
+        logger.info(f"Slot filling: missing {missing}")
+        return jsonify({"fulfillmentText": f"Укажите {', '.join(missing)} начала события."})
+
+    # Парсим дату окончания из текста
     end_dt = None
     end_match = re.search(r"(?:по|до)\s+([0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4}(?:\s+[0-9]{1,2}:[0-9]{2})?)", query_text, re.IGNORECASE)
     if end_match:
@@ -289,13 +378,10 @@ def handle_reminder(params, query_text, chat_id):
             end_dt = parse_from_text(all_dates[1])
 
     # Fallback: end = start + 1 час
-    if not end_dt and start_dt:
+    if not end_dt:
         end_dt = start_dt + timedelta(hours=1)
 
-    if not name or not start_dt:
-        logger.warning(f"Missing params: name={name}, start_dt={start_dt}")
-        return jsonify({"fulfillmentText": "Укажите название, дату и время начала события."})
-
+    # Создаём событие
     job_ids = schedule_reminders(chat_id, "event", name, start_dt, end_dt)
 
     events.append({
@@ -310,50 +396,53 @@ def handle_reminder(params, query_text, chat_id):
     })
 
     response_text = f"Добавлено новое событие «{name}» с {format_dt(start_dt)} по {format_dt(end_dt)}"
-    logger.info(f"Reminder response: {response_text}")
+    logger.info(f"Reminder created: {response_text}")
 
     # Отправляем подтверждение в Telegram
     send_telegram_message(chat_id, f"✅ {response_text}")
 
     return jsonify({"fulfillmentText": response_text})
 
-def handle_olympiad(params, query_text, chat_id):
+def handle_olympiad(params, query_text, chat_id, all_required_present):
     """
-    Параметры Dialogflow:
-    - any: @sys.any (название олимпиады)
-    - subject: @subject (предмет)
-    - level: @level (уровень 1/2/3)
-    - FROM: @sys.date (дата начала)
-    - to: @sys.date (дата окончания)
+    Обрабатывает создание олимпиады.
     """
+    # Пробуем получить из параметров Dialogflow
     name = get_param(params, "any")
     subject = get_param(params, "subject")
     level = get_param(params, "level")
-
     start_date = get_param(params, "FROM")
     end_date = get_param(params, "to")
 
     start_dt = parse_date_time(start_date, None) if start_date else None
     end_dt = parse_date_time(end_date, None) if end_date else None
 
-    # Fallback: парсим из текста
-    if not start_dt or not end_dt:
-        all_dates = re.findall(r"[0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4}", query_text)
-        if len(all_dates) >= 2:
-            if not start_dt:
-                start_dt = parse_from_text(all_dates[0])
-            if not end_dt:
-                end_dt = parse_from_text(all_dates[1])
+    # Если не хватает — парсим из текста
+    if not name or not start_dt or not end_dt or not subject or not level:
+        p_name, p_start, p_end, p_subj, p_lvl = parse_olympiad_from_text(query_text)
+        if p_name and not name: name = p_name
+        if p_start and not start_dt: start_dt = p_start
+        if p_end and not end_dt: end_dt = p_end
+        if p_subj and not subject: subject = p_subj
+        if p_lvl and not level: level = p_lvl
 
-    # Добавляем время по умолчанию (олимпиады обычно с 9:00 до 14:00)
+    # Добавляем время по умолчанию
     if start_dt and start_dt.hour == 0 and start_dt.minute == 0:
         start_dt = start_dt.replace(hour=9, minute=0)
     if end_dt and end_dt.hour == 0 and end_dt.minute == 0:
         end_dt = end_dt.replace(hour=14, minute=0)
 
+    # Проверяем, всё ли есть
     if not name or not start_dt or not end_dt:
-        logger.warning(f"Missing olympiad params: name={name}, start={start_dt}, end={end_dt}")
-        return jsonify({"fulfillmentText": "Укажите название олимпиады, предмет, уровень и даты."})
+        missing = []
+        if not name: missing.append("название")
+        if not start_dt: missing.append("дату начала")
+        if not end_dt: missing.append("дату окончания")
+        if not subject: missing.append("предмет")
+        if not level: missing.append("уровень")
+
+        logger.info(f"Olympiad slot filling: missing {missing}")
+        return jsonify({"fulfillmentText": f"Укажите {', '.join(missing)} олимпиады."})
 
     job_ids = schedule_reminders(chat_id, "olympiad", name, start_dt, end_dt, subject, level)
 
@@ -369,29 +458,33 @@ def handle_olympiad(params, query_text, chat_id):
     })
 
     response_text = f"Добавлена новая олимпиада «{name}» {subject} {level} уровня с {format_dt(start_dt)} по {format_dt(end_dt)}"
-    logger.info(f"Olympiad response: {response_text}")
+    logger.info(f"Olympiad created: {response_text}")
 
-    # Отправляем подтверждение в Telegram
     send_telegram_message(chat_id, f"✅ {response_text}")
 
     return jsonify({"fulfillmentText": response_text})
 
 def handle_cancel(params, query_text, chat_id):
     """
-    Параметры Dialogflow:
-    - any: @sys.any (название события/олимпиады)
-    - date: @sys.date (дата начала)
+    Удаление события или олимпиады.
     """
     name = get_param(params, "any")
     date_val = get_param(params, "date")
 
     start_dt = parse_date_time(date_val, None) if date_val else None
 
-    # Fallback: парсим дату-время из текста
+    # Fallback: парсим из текста
     if not start_dt:
         all_dates = re.findall(r"[0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4}(?:\s+[0-9]{1,2}:[0-9]{2})?", query_text)
         if all_dates:
             start_dt = parse_from_text(all_dates[0])
+
+    if not name:
+        # Пробуем вытащить название из текста
+        cleaned = re.sub(r'^(отмени|отмена|отменить|удали|удалить|удаление)\s+', '', query_text, flags=re.IGNORECASE)
+        name_match = re.search(r'^(.+?)\s+\d', cleaned)
+        if name_match:
+            name = name_match.group(1).strip()
 
     if not name:
         logger.warning("Cancel: no name provided")
@@ -404,10 +497,8 @@ def handle_cancel(params, query_text, chat_id):
         if event["chat_id"] != chat_id:
             continue
 
-        # Проверяем совпадение по названию
         title_match = name.lower() in event["name"].lower() or event["name"].lower() in name.lower()
 
-        # Проверяем совпадение по дате (если указана)
         date_match = True
         if start_dt:
             event_date = event["start_dt"].strftime("%d.%m.%Y")
@@ -442,9 +533,7 @@ def health():
 def index():
     return "Reminder Bot is running!"
 
-# ===================== NO if __name__ for Gunicorn =====================
-# Gunicorn запускает app напрямую, блок if __name__ не нужен
-# Но оставим для локального тестирования с правильным портом
+# ===================== RUN =====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
