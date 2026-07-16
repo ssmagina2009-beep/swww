@@ -179,11 +179,9 @@ def extract_datetime(params, date_key, time_key):
 # ===================== PARSER FROM TEXT =====================
 def parse_event_from_text(text):
     """Парсит название, дату и время из текста сообщения."""
-    # Убираем ключевые слова
     cleaned = re.sub(r'^(создать|сделать|создай|сделай|напоминание|событие|event|reminder)\s+', '', text, flags=re.IGNORECASE)
     cleaned = re.sub(r'\s+(создать|сделать|создай|сделай|напоминание|событие|event|reminder)\s+', ' ', cleaned, flags=re.IGNORECASE)
 
-    # Ищем дату и время
     date_patterns = [
         r'(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})',
         r'(\d{1,2}\.\d{1,2}\.\d{2})\s+(\d{1,2}:\d{2})',
@@ -222,7 +220,6 @@ def parse_olympiad_from_text(text):
     start_dt = parse_date_time(dates[0], None) if len(dates) > 0 else None
     end_dt = parse_date_time(dates[1], None) if len(dates) > 1 else None
 
-    # Убираем даты из текста
     temp_text = re.sub(date_pattern, '', cleaned, count=2)
     parts = [p.strip() for p in temp_text.split() if p.strip()]
 
