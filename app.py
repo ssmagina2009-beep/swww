@@ -1,391 +1,473 @@
-
-app_py_code = r'''import logging
+import os
 import json
 import re
-import asyncio
-import threading
+import pytz
 from datetime import datetime, timedelta
-from dateutil import parser as date_parser
-
 from flask import Flask, request, jsonify
-from telegram import Bot
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
+import requests
 
-# ===================== SETTINGS =====================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-
-# Reminder times (hours before event)
-REMINDER_DELTAS = [168, 48, 24, 0]
-
-# ===================== LOGGING =====================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# ===================== INIT =====================
 app = Flask(__name__)
-bot = Bot(token=BOT_TOKEN)
 
-# ===================== STORAGE =====================
-events = []
-scheduled_jobs = {}
+# ─── Конфигурация ─────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ===================== DATE/TIME PARSER =====================
-def parse_date_time(date_str, time_str):
-    if not date_str:
-        return None
-    date_str = str(date_str).strip()
-    time_str = str(time_str).strip() if time_str else ""
+# Хранилище напоминаний (в продакшене лучше использовать БД)
+# Структура: {chat_id: [{"type": "event"/"olympiad", "title": ..., "start": ..., ...}]}
+reminders_db = {}
+
+scheduler = BackgroundScheduler(timezone=pytz.timezone('Europe/Moscow'))
+scheduler.start()
+
+# ─── Вспомогательные функции ──────────────────────────────────────────────────
+
+def send_message(chat_id, text, reply_markup=None):
+    """Отправка сообщения в Telegram"""
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+
     try:
-        if time_str:
-            dt_str = f"{date_str} {time_str}"
-            return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-        else:
-            return datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError:
-        try:
-            if time_str:
-                dt_str = f"{date_str} {time_str}"
-                return datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
-            else:
-                return datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            try:
-                full = f"{date_str} {time_str}" if time_str else date_str
-                return date_parser.parse(full)
-            except Exception:
-                return None
-
-def parse_from_text(text):
-    if not text:
-        return None
-    try:
-        return date_parser.parse(text.strip(), dayfirst=True)
-    except Exception:
-        return None
-
-def format_dt(dt):
-    return dt.strftime("%d.%m.%Y %H:%M")
-
-# ===================== SCHEDULER =====================
-def schedule_reminders(chat_id, event_type, name, start_dt, end_dt, subject=None, level=None):
-    job_ids = []
-    now = datetime.now()
-    for delta_hours in REMINDER_DELTAS:
-        reminder_time = start_dt - timedelta(hours=delta_hours)
-        if reminder_time <= now:
-            continue
-        job_id = f"{chat_id}_{name}_{start_dt.isoformat()}_{delta_hours}"
-        scheduled_jobs[job_id] = {
-            "chat_id": chat_id,
-            "run_at": reminder_time,
-            "data": {
-                "event_type": event_type,
-                "name": name,
-                "start_dt": start_dt,
-                "end_dt": end_dt,
-                "subject": subject,
-                "level": level,
-                "delta_hours": delta_hours,
-            }
-        }
-        job_ids.append(job_id)
-    return job_ids
-
-# ===================== SEND REMINDERS =====================
-async def send_reminder(job_id):
-    if job_id not in scheduled_jobs:
-        return
-    job = scheduled_jobs[job_id]
-    data = job["data"]
-    chat_id = job["chat_id"]
-    hours_text = str(data["delta_hours"]) if data["delta_hours"] > 0 else "0"
-    start_str = format_dt(data["start_dt"])
-    end_str = format_dt(data["end_dt"])
-    if data["event_type"] == "olympiad":
-        text = (f"Napominaie! Cherez {hours_text} chasov budet olimpiada "
-                f"{data['name']} {data['subject']} {data['level']} urovnja "
-                f"s {start_str} po {end_str}")
-    else:
-        text = (f"Napominaie! Cherez {hours_text} chasov budet sobytie "
-                f"{data['name']} s {start_str} po {end_str}")
-    try:
-        await bot.send_message(chat_id=chat_id, text=text)
+        requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
     except Exception as e:
-        logger.error(f"Oshibka otpravki: {e}")
-    if job_id in scheduled_jobs:
-        del scheduled_jobs[job_id]
+        print(f"Ошибка отправки: {e}")
 
-# ===================== PARAM EXTRACTOR =====================
-def get_param(params, name, default=None):
-    val = params.get(name, default)
-    if isinstance(val, dict):
-        return val.get("name") or val.get("value") or str(val)
-    return val
+def get_main_keyboard():
+    """Главная клавиатура с кнопками"""
+    return {
+        "keyboard": [
+            [{"text": "👋 Привет"}],
+            [{"text": "📅 Создать событие"}],
+            [{"text": "🏆 Новая олимпиада"}],
+            [{"text": "🗑 Удалить событие"}]
+        ],
+        "resize_keyboard": True
+    }
 
-def extract_datetime(params, date_key, time_key):
-    d = get_param(params, date_key)
-    t = get_param(params, time_key)
-    if d:
-        return parse_date_time(str(d), str(t) if t else None)
+def parse_datetime(date_str, time_str=None):
+    """Парсинг даты и времени из строки"""
+    formats = [
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%y %H:%M",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M",
+        "%d.%m.%Y",
+        "%d.%m.%y",
+        "%Y-%m-%d",
+        "%d/%m/%Y"
+    ]
+
+    combined = f"{date_str} {time_str}" if time_str else date_str
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(combined.strip(), fmt)
+            # Если время не указано, ставим 00:00
+            if time_str is None and "%H:%M" not in fmt:
+                dt = dt.replace(hour=0, minute=0)
+            return dt
+        except ValueError:
+            continue
     return None
 
-# ===================== WEBHOOK =====================
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    req = request.get_json(silent=True, force=True)
-    logger.info(f"Webhook received: {json.dumps(req, ensure_ascii=False)}")
-    
-    intent_name = req.get("queryResult", {}).get("intent", {}).get("displayName", "").lower()
-    params = req.get("queryResult", {}).get("parameters", {})
-    query_text = req.get("queryResult", {}).get("queryText", "")
-    
-    # Get chat_id from Telegram context
-    output_contexts = req.get("queryResult", {}).get("outputContexts", [])
-    chat_id = None
-    
-    for ctx in output_contexts:
-        ctx_name = ctx.get("name", "")
-        ctx_params = ctx.get("parameters", {})
-        if "telegram" in ctx_name.lower():
-            chat_id = ctx_params.get("chat_id") or ctx_params.get("chatId") or ctx_params.get("from_id")
-        if not chat_id:
-            chat_id = ctx_params.get("chat_id") or ctx_params.get("chatId")
-    
-    # Fallback: originalDetectIntentRequest
-    if not chat_id:
-        orig = req.get("originalDetectIntentRequest", {})
-        payload = orig.get("payload", {})
-        chat_id = payload.get("data", {}).get("chat", {}).get("id")
-    
-    # Fallback: session
-    if not chat_id:
-        session = req.get("session", "")
-        if "/sessions/" in session:
-            chat_id = session.split("/sessions/")[-1]
-    
-    if not chat_id:
-        logger.error("chat_id not found!")
-        return jsonify({"fulfillmentText": "Oshibka: ne udalos opredelit chat."})
-    
-    try:
-        chat_id = int(chat_id)
-    except:
-        pass
-    
-    logger.info(f"Intent: {intent_name}, chat_id: {chat_id}, params: {params}")
-    
-    # --- REMINDER ---
-    if "napomina" in intent_name or "reminder" in intent_name:
-        return handle_reminder(params, query_text, chat_id)
-    
-    # --- OLYMPIAD ---
-    elif "olimpiad" in intent_name or "olympiad" in intent_name:
-        return handle_olympiad(params, query_text, chat_id)
-    
-    # --- CANCEL ---
-    elif "otmen" in intent_name or "cancel" in intent_name:
-        return handle_cancel(params, query_text, chat_id)
-    
-    return jsonify({"fulfillmentText": "Ne ponjal komandu."})
+def schedule_reminder(chat_id, reminder_type, title, start_dt, extra_info=None):
+    """Планирование напоминаний"""
 
-def handle_reminder(params, query_text, chat_id):
-    name = get_param(params, "name")
-    start_dt = extract_datetime(params, "date", "time")
-    
-    # Parse end date from text
-    end_dt = None
-    end_match = re.search(r"(?:po|do)\s+([0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4}(?:\s+[0-9]{1,2}:[0-9]{2})?)", query_text, re.IGNORECASE)
-    if end_match:
-        end_dt = parse_from_text(end_match.group(1))
-    
-    if not end_dt:
-        all_dates = re.findall(r"[0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4}(?:\s+[0-9]{1,2}:[0-9]{2})?", query_text)
-        if len(all_dates) >= 2:
-            end_dt = parse_from_text(all_dates[1])
-    
-    if not end_dt and start_dt:
-        end_dt = start_dt + timedelta(hours=1)
-    
-    if not name or not start_dt:
-        return jsonify({"fulfillmentText": "Ukažite nazvanie, datu i vremja načala sobytija."})
-    
-    job_ids = schedule_reminders(chat_id, "event", name, start_dt, end_dt)
-    
-    events.append({
-        "chat_id": chat_id,
-        "event_type": "event",
-        "name": name,
-        "start_dt": start_dt,
-        "end_dt": end_dt,
-        "subject": None,
-        "level": None,
-        "job_ids": job_ids,
-    })
-    
-    response_text = f"Dobavleno novoe sobytie {name} s {format_dt(start_dt)} po {format_dt(end_dt)}"
-    logger.info(f"Reminder response: {response_text}")
-    
-    return jsonify({"fulfillmentText": response_text})
+    # Время напоминаний: 168ч, 48ч, 24ч и в момент события
+    reminder_times = [
+        (168, "168"),
+        (48, "48"),
+        (24, "24"),
+        (0, "0")
+    ]
 
-def handle_olympiad(params, query_text, chat_id):
-    name = get_param(params, "any")
-    subject = get_param(params, "subject")
-    level = get_param(params, "level")
-    
-    start_date = get_param(params, "FROM")
-    end_date = get_param(params, "to")
-    
-    start_dt = parse_date_time(start_date, None) if start_date else None
-    end_dt = parse_date_time(end_date, None) if end_date else None
-    
-    if not start_dt or not end_dt:
-        all_dates = re.findall(r"[0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4}", query_text)
-        if len(all_dates) >= 2:
-            if not start_dt:
-                start_dt = parse_from_text(all_dates[0])
-            if not end_dt:
-                end_dt = parse_from_text(all_dates[1])
-    
-    if start_dt and start_dt.hour == 0 and start_dt.minute == 0:
-        start_dt = start_dt.replace(hour=9, minute=0)
-    if end_dt and end_dt.hour == 0 and end_dt.minute == 0:
-        end_dt = end_dt.replace(hour=14, minute=0)
-    
-    if not name or not start_dt or not end_dt:
-        return jsonify({"fulfillmentText": "Ukažite nazvanie olimpiady, predmet, uroven i daty."})
-    
-    job_ids = schedule_reminders(chat_id, "olympiad", name, start_dt, end_dt, subject, level)
-    
-    events.append({
-        "chat_id": chat_id,
-        "event_type": "olympiad",
-        "name": name,
-        "start_dt": start_dt,
-        "end_dt": end_dt,
+    job_ids = []
+
+    for hours_before, hours_label in reminder_times:
+        reminder_dt = start_dt - timedelta(hours=hours_before)
+
+        # Не планируем, если время уже прошло
+        if reminder_dt < datetime.now(pytz.timezone('Europe/Moscow')).replace(tzinfo=None):
+            continue
+
+        job_id = f"{chat_id}_{reminder_type}_{title}_{start_dt.strftime('%Y%m%d%H%M')}_{hours_before}"
+
+        if reminder_type == "event":
+            message = f'напоминание! Через «{hours_label}» часов будет событие «{title}» с {start_dt.strftime("%d.%m.%Y %H:%M")}'
+        else:  # olympiad
+            subject = extra_info.get("subject", "")
+            level = extra_info.get("level", "")
+            end_dt = extra_info.get("end_dt", start_dt)
+            message = f'напоминание! Через «{hours_label}» часов будет олимпиада «{title}» {subject} {level} уровня с {start_dt.strftime("%d.%m.%Y")} по {end_dt.strftime("%d.%m.%Y")}'
+
+        scheduler.add_job(
+            send_message,
+            trigger=DateTrigger(run_date=reminder_dt),
+            args=[chat_id, message],
+            id=job_id,
+            replace_existing=True
+        )
+        job_ids.append(job_id)
+
+    return job_ids
+
+def remove_reminder_jobs(job_ids):
+    """Удаление запланированных задач"""
+    for job_id in job_ids:
+        try:
+            scheduler.remove_job(job_id)
+        except:
+            pass
+
+# ─── Обработчики команд и сообщений ───────────────────────────────────────────
+
+def handle_start(chat_id):
+    """Обработка команды /start и кнопки Привет"""
+    welcome_text = (
+        "👋 Привет! Я бот для напоминаний!
+
+"
+        "📌 <b>Что я умею:</b>
+"
+        "• Создавать события с напоминаниями
+"
+        "• Добавлять олимпиады с отслеживанием
+"
+        "• Удалять созданные события
+
+"
+        "📝 <b>Как создать событие:</b>
+"
+        "Напишите: «создать событие Название дд.мм.гггг чч:мм»
+
+"
+        "🏆 <b>Как добавить олимпиаду:</b>
+"
+        "Напишите: «олимпиада Название дд.мм.гггг дд.мм.гггг Предмет Уровень»
+
+"
+        "🗑 <b>Как удалить:</b>
+"
+        "Напишите: «отменить Название дд.мм.гггг»
+
+"
+        "Используйте кнопки ниже для удобства!"
+    )
+    send_message(chat_id, welcome_text, get_main_keyboard())
+
+def handle_create_event(chat_id, text):
+    """Создание события/напоминания"""
+    # Паттерны для поиска данных
+    # Форматы: "создать/сделать/создай/сделай событие/напоминание Название дата время"
+
+    # Убираем ключевые слова из начала
+    cleaned = re.sub(r'^(создать|сделать|создай|сделай|напоминание|событие)\s+', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+(создать|сделать|создай|сделай|напоминание|событие)\s+', ' ', cleaned, flags=re.IGNORECASE)
+
+    # Ищем дату и время
+    # Паттерны дат: дд.мм.гггг, дд.мм.гг, гггг-мм-дд
+    date_patterns = [
+        r'(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})',  # дд.мм.гггг чч:мм
+        r'(\d{1,2}\.\d{1,2}\.\d{2})\s+(\d{1,2}:\d{2})',   # дд.мм.гг чч:мм
+        r'(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})',          # гггг-мм-дд чч:мм
+        r'(\d{1,2}\/\d{1,2}\/\d{4})\s+(\d{1,2}:\d{2})',   # дд/мм/гггг чч:мм
+        r'(\d{1,2}\.\d{1,2}\.\d{4})',                      # только дата
+        r'(\d{1,2}\.\d{1,2}\.\d{2})',
+        r'(\d{4}-\d{2}-\d{2})',
+    ]
+
+    start_dt = None
+    title = cleaned
+
+    for pattern in date_patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            if len(match.groups()) == 2:
+                start_dt = parse_datetime(match.group(1), match.group(2))
+            else:
+                start_dt = parse_datetime(match.group(1))
+
+            if start_dt:
+                # Убираем дату и время из названия
+                title = cleaned[:match.start()].strip()
+                break
+
+    if not start_dt:
+        send_message(chat_id, "❌ Не удалось распознать дату и время.
+Формат: «создать событие Название дд.мм.гггг чч:мм»")
+        return
+
+    if not title:
+        send_message(chat_id, "❌ Укажите название события.")
+        return
+
+    # Сохраняем в базу
+    if chat_id not in reminders_db:
+        reminders_db[chat_id] = []
+
+    reminder = {
+        "type": "event",
+        "title": title,
+        "start": start_dt,
+        "job_ids": []
+    }
+
+    # Планируем напоминания
+    job_ids = schedule_reminder(chat_id, "event", title, start_dt)
+    reminder["job_ids"] = job_ids
+    reminders_db[chat_id].append(reminder)
+
+    send_message(
+        chat_id,
+        f'✅ добавлено новое событие «{title}» с {start_dt.strftime("%d.%m.%Y %H:%M")}'
+    )
+
+def handle_create_olympiad(chat_id, text):
+    """Создание олимпиады"""
+    # Формат: "олимпиада Название дата_начала дата_конца Предмет Уровень"
+    # Убираем ключевое слово
+    cleaned = re.sub(r'^олимпиада\s+', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+олимпиада\s+', ' ', cleaned, flags=re.IGNORECASE)
+
+    # Ищем две даты
+    date_pattern = r'(\d{1,2}\.\d{1,2}\.\d{4})'
+    dates = re.findall(date_pattern, cleaned)
+
+    if len(dates) < 1:
+        send_message(chat_id, "❌ Не удалось распознать даты.
+Формат: «олимпиада Название дд.мм.гггг дд.мм.гггг Предмет Уровень»")
+        return
+
+    start_dt = parse_datetime(dates[0])
+    end_dt = parse_datetime(dates[1]) if len(dates) > 1 else start_dt
+
+    if not start_dt:
+        send_message(chat_id, "❌ Неверный формат даты начала.")
+        return
+
+    # Убираем даты из текста
+    temp_text = re.sub(date_pattern, '', cleaned, count=2)
+    parts = [p.strip() for p in temp_text.split() if p.strip()]
+
+    # Последнее слово — уровень (1/2/3)
+    level = None
+    if parts and parts[-1] in ['1', '2', '3']:
+        level = parts[-1]
+        parts = parts[:-1]
+
+    # Предмет — предпоследнее (или последнее, если уровень не найден)
+    subject = ""
+    if parts:
+        subject = parts[-1]
+        parts = parts[:-1]
+
+    # Оставшееся — название
+    title = ' '.join(parts) if parts else "Олимпиада"
+
+    if not level:
+        send_message(chat_id, "❌ Укажите уровень олимпиады (1, 2 или 3).")
+        return
+
+    # Сохраняем
+    if chat_id not in reminders_db:
+        reminders_db[chat_id] = []
+
+    reminder = {
+        "type": "olympiad",
+        "title": title,
+        "start": start_dt,
+        "end": end_dt,
         "subject": subject,
         "level": level,
-        "job_ids": job_ids,
-    })
-    
-    response_text = f"Dobavlena novaja olimpiada {name} {subject} {level} urovnja s {format_dt(start_dt)} po {format_dt(end_dt)}"
-    logger.info(f"Olympiad response: {response_text}")
-    
-    return jsonify({"fulfillmentText": response_text})
+        "job_ids": []
+    }
 
-def handle_cancel(params, query_text, chat_id):
-    name = get_param(params, "any")
-    date_val = get_param(params, "date")
-    
-    start_dt = parse_date_time(date_val, None) if date_val else None
-    
-    if not start_dt:
-        dt_match = re.search(r"[0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4}(?:\s+[0-9]{1,2}:[0-9]{2})?", query_text)
-        if dt_match:
-            start_dt = parse_from_text(dt_match.group(0))
-    
-    if not name or not start_dt:
-        return jsonify({"fulfillmentText": "Ukažite nazvanie i datu sobytija dlja otmeny."})
-    
+    extra_info = {"subject": subject, "level": level, "end_dt": end_dt}
+    job_ids = schedule_reminder(chat_id, "olympiad", title, start_dt, extra_info)
+    reminder["job_ids"] = job_ids
+    reminders_db[chat_id].append(reminder)
+
+    send_message(
+        chat_id,
+        f'✅ добавлена новая олимпиада «{title}» {subject} {level} уровня с {start_dt.strftime("%d.%m.%Y")} по {end_dt.strftime("%d.%m.%Y")}'
+    )
+
+def handle_delete_event(chat_id, text):
+    """Удаление события или олимпиады"""
+    # Убираем ключевые слова
+    cleaned = re.sub(r'^(отмени|отмена|отменить|удали|удалить|удаление)\s+', '', text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+(отмени|отмена|отменить|удали|удалить|удаление)\s+', ' ', cleaned, flags=re.IGNORECASE)
+
+    # Ищем дату
+    date_pattern = r'(\d{1,2}\.\d{1,2}\.\d{4})'
+    match = re.search(date_pattern, cleaned)
+
+    search_date = None
+    title = cleaned
+
+    if match:
+        search_date = parse_datetime(match.group(1))
+        title = cleaned[:match.start()].strip()
+
+    if chat_id not in reminders_db or not reminders_db[chat_id]:
+        send_message(chat_id, "❌ не нашел событие")
+        return
+
     found = False
-    to_remove = []
-    
-    for i, event in enumerate(events):
-        if (
-            event["chat_id"] == chat_id
-            and event["name"].lower() == name.lower()
-            and event["start_dt"].strftime("%d.%m.%Y %H:%M") == start_dt.strftime("%d.%m.%Y %H:%M")
-        ):
-            for job_id in event["job_ids"]:
-                if job_id in scheduled_jobs:
-                    del scheduled_jobs[job_id]
-            to_remove.append(i)
+    for i, reminder in enumerate(reminders_db[chat_id]):
+        # Проверяем совпадение по названию
+        title_match = title.lower() in reminder["title"].lower() or reminder["title"].lower() in title.lower()
+
+        # Проверяем совпадение по дате (если указана)
+        date_match = True
+        if search_date:
+            reminder_date = reminder["start"].strftime("%d.%m.%Y")
+            search_date_str = search_date.strftime("%d.%m.%Y")
+            date_match = reminder_date == search_date_str
+
+        if title_match and date_match:
+            # Удаляем задачи
+            remove_reminder_jobs(reminder["job_ids"])
+            # Удаляем из базы
+            event_type = "событие" if reminder["type"] == "event" else "олимпиада"
+            del reminders_db[chat_id][i]
+            send_message(chat_id, f'🗑 удалил {event_type} «{reminder["title"]}»')
             found = True
-    
-    for idx in reversed(to_remove):
-        events.pop(idx)
-    
-    if found:
-        return jsonify({"fulfillmentText": f"Udalil {name}"})
+            break
+
+    if not found:
+        send_message(chat_id, "❌ не нашел событие")
+
+def process_message(chat_id, text):
+    """Главный обработчик входящих сообщений"""
+    text_lower = text.lower()
+
+    # Кнопки меню
+    if text == "👋 Привет" or text.lower() in ['/start', 'привет', 'hello', 'hi']:
+        handle_start(chat_id)
+        return
+
+    if text == "📅 Создать событие":
+        send_message(
+            chat_id,
+            "📝 Для создания события напишите:
+"
+            "«создать событие Название дд.мм.гггг чч:мм»
+
+"
+            "Пример: создать событие Экзамен по математике 25.12.2024 09:00",
+            get_main_keyboard()
+        )
+        return
+
+    if text == "🏆 Новая олимпиада":
+        send_message(
+            chat_id,
+            "🏆 Для добавления олимпиады напишите:
+"
+            "«олимпиада Название дд.мм.гггг дд.мм.гггг Предмет Уровень»
+
+"
+            "Пример: олимпиада Всероссийская олимпиада 15.01.2025 20.01.2025 Математика 3",
+            get_main_keyboard()
+        )
+        return
+
+    if text == "🗑 Удалить событие":
+        send_message(
+            chat_id,
+            "🗑 Для удаления напишите:
+"
+            "«отменить Название дд.мм.гггг»
+
+"
+            "Пример: отменить Экзамен по математике 25.12.2024",
+            get_main_keyboard()
+        )
+        return
+
+    # Определяем тип сообщения по ключевым словам
+    event_keywords = ['напоминание', 'событие', 'сделать', 'сделай', 'создай', 'создать']
+    olympiad_keywords = ['олимпиада']
+    delete_keywords = ['отмени', 'отмена', 'отменить', 'удали', 'удалить']
+
+    is_event = any(kw in text_lower for kw in event_keywords)
+    is_olympiad = any(kw in text_lower for kw in olympiad_keywords)
+    is_delete = any(kw in text_lower for kw in delete_keywords)
+
+    if is_delete:
+        handle_delete_event(chat_id, text)
+    elif is_olympiad:
+        handle_create_olympiad(chat_id, text)
+    elif is_event:
+        handle_create_event(chat_id, text)
     else:
-        return jsonify({"fulfillmentText": f"Ne nashol {name} s {format_dt(start_dt)}"})
+        # Не распознали — показываем подсказку
+        send_message(
+            chat_id,
+            "🤔 Я не понял команду.
 
-# ===================== BACKGROUND SCHEDULER =====================
-async def scheduler_loop():
-    while True:
-        now = datetime.now()
-        for job_id, job in list(scheduled_jobs.items()):
-            if job["run_at"] <= now:
-                await send_reminder(job_id)
-        await asyncio.sleep(30)
+"
+            "Используйте кнопки меню или напишите:
+"
+            "• «создать событие Название дата время»
+"
+            "• «олимпиада Название дата_начала дата_конца Предмет Уровень»
+"
+            "• «отменить Название дата»",
+            get_main_keyboard()
+        )
 
-# ===================== RUN =====================
+# ─── Webhook endpoints ────────────────────────────────────────────────────────
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Основной webhook для Dialogflow / Telegram"""
+    data = request.get_json(silent=True, force=True)
+
+    # Dialogflow формат
+    if 'originalDetectIntentRequest' in data:
+        payload = data.get('originalDetectIntentRequest', {}).get('payload', {})
+        if 'data' in payload:
+            # Telegram update через Dialogflow
+            telegram_data = payload['data']
+            if 'message' in telegram_data:
+                chat_id = telegram_data['message']['chat']['id']
+                text = telegram_data['message'].get('text', '')
+                process_message(chat_id, text)
+
+        # Ответ для Dialogflow
+        return jsonify({
+            "fulfillmentText": "Обработано",
+            "fulfillmentMessages": [{"text": {"text": ["Обработано"]}}]
+        })
+
+    # Прямой Telegram webhook
+    if 'message' in data:
+        chat_id = data['message']['chat']['id']
+        text = data['message'].get('text', '')
+        process_message(chat_id, text)
+        return jsonify({"status": "ok"})
+
+    return jsonify({"status": "unknown_format"})
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({"status": "ok", "reminders_count": sum(len(v) for v in reminders_db.values())})
+
 @app.route('/')
 def index():
-    return "Bot is running!"
+    return "Reminder Bot is running!"
 
-if __name__ == "__main__":
-    def run_scheduler():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(scheduler_loop())
-    
-    t = threading.Thread(target=run_scheduler, daemon=True)
-    t.start()
-    
-    app.run(host="0.0.0.0", port=8080)
-'''
+# ─── Запуск ───────────────────────────────────────────────────────────────────
 
-# Заменяем транслит на русский текст
-replacements = {
-    'Napominaie': 'Напоминание',
-    'Cherez': 'Через',
-    'chasov': 'часов',
-    'budet': 'будет',
-    'olimpiada': 'олимпиада',
-    'urovnja': 'уровня',
-    's ': 'с ',
-    'po ': 'по ',
-    'sobytie': 'событие',
-    'Oshibka': 'Ошибка',
-    'otpravki': 'отправки',
-    'opredelit': 'определить',
-    'chat': 'чат',
-    'Ne ponjal': 'Не понял',
-    'komandu': 'команду',
-    'Ukažite': 'Укажите',
-    'nazvanie': 'название',
-    'datu': 'дату',
-    'vremja': 'время',
-    'načala': 'начала',
-    'sobytija': 'события',
-    'Dobavleno': 'Добавлено',
-    'novoe': 'новое',
-    'sobytie': 'событие',
-    'predmet': 'предмет',
-    'uroven': 'уровень',
-    'Dobavlena': 'Добавлена',
-    'novaja': 'новая',
-    'olimpiada': 'олимпиада',
-    'dlja': 'для',
-    'otmeny': 'отмены',
-    'Udalil': 'Удалил',
-    'Ne nashol': 'Не нашёл',
-    'Webhook received': 'Получен webhook',
-    'Reminder response': 'Ответ напоминания',
-    'Olympiad response': 'Ответ олимпиады',
-    'chat_id not found': 'chat_id не найден',
-    'Intent': 'Интент',
-}
-
-# Делаем замены аккуратно
-for old, new in replacements.items():
-    app_py_code = app_py_code.replace(old, new)
-
-with open('/mnt/agents/output/app.py', 'w', encoding='utf-8') as f:
-    f.write(app_py_code)
-
-print("app.py updated with Russian text!")
-print(f"Size: {len(app_py_code)} chars")
-
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
