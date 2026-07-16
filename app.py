@@ -175,8 +175,12 @@ def remove_reminder_jobs(job_ids):
 
 # ===================== PARAM EXTRACTOR =====================
 def get_param(params, name, default=None):
+    """Извлекает параметр из Dialogflow, обрабатывает объекты."""
     val = params.get(name, default)
     if isinstance(val, dict):
+        # Dialogflow иногда шлёт {"date_time": "2026-12-12T00:30:00+05:00"}
+        if "date_time" in val:
+            return val["date_time"]
         return val.get("name") or val.get("value") or str(val)
     return val
 
