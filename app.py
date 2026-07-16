@@ -8,9 +8,14 @@ from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 import requests
+import pytz
 
 # ===================== SETTINGS =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "NOT_SET")
+
+# Часовой пояс пользователя (UTC+5 — определяется по Dialogflow или дефолт)
+USER_TIMEZONE = pytz.timezone('Asia/Yekaterinburg')  # UTC+5
+UTC = pytz.UTC
 
 # Reminder times (hours before event)
 REMINDER_DELTAS = [168, 48, 24, 0]
@@ -30,12 +35,12 @@ events = []
 scheduled_jobs = {}
 
 # ===================== SCHEDULER =====================
-scheduler = BackgroundScheduler()
+scheduler = BackgroundScheduler(timezone=UTC)
 scheduler.start()
 
 # ===================== DATE/TIME PARSER =====================
-def parse_date_time(date_str, time_str):
-    """Собирает datetime из date и time от Dialogflow."""
+def parse_date_time(date_str, time_str, timezone_offset="+05:00"):
+    """Собирает datetime из date и time от Dialogflow с учётом часового пояса."""
     if not date_str:
         return None
     date_str = str(date_str).strip()
@@ -46,24 +51,33 @@ def parse_date_time(date_str, time_str):
         if 'T' in date_str:
             # Убираем timezone (+05:00 или Z)
             dt_str = date_str.split('+')[0].split('Z')[0]
-            return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+            dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+            # Применяем часовой пояс пользователя
+            dt = USER_TIMEZONE.localize(dt)
+            return dt
 
         if time_str:
             # Dialogflow time тоже может быть в ISO: 2026-07-17T14:44:00+05:00
             if 'T' in time_str:
                 dt_str = time_str.split('+')[0].split('Z')[0]
-                return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+                dt = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
+                dt = USER_TIMEZONE.localize(dt)
+                return dt
 
             dt_str = f"{date_str} {time_str}"
             for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m.%y %H:%M"]:
                 try:
-                    return datetime.strptime(dt_str, fmt)
+                    dt = datetime.strptime(dt_str, fmt)
+                    dt = USER_TIMEZONE.localize(dt)
+                    return dt
                 except ValueError:
                     continue
         else:
             for fmt in ["%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"]:
                 try:
-                    return datetime.strptime(date_str, fmt)
+                    dt = datetime.strptime(date_str, fmt)
+                    dt = USER_TIMEZONE.localize(dt)
+                    return dt
                 except ValueError:
                     continue
     except Exception as e:
@@ -117,11 +131,19 @@ def get_main_keyboard():
 # ===================== SCHEDULER =====================
 def schedule_reminders(chat_id, event_type, name, start_dt, end_dt, subject=None, level=None):
     job_ids = []
-    now = datetime.now()
+    now = datetime.now(USER_TIMEZONE)  # Текущее время в часовом поясе пользователя
+
+    logger.info(f"Scheduling reminders. Now: {now}, Event start: {start_dt}")
 
     for delta_hours in REMINDER_DELTAS:
         reminder_time = start_dt - timedelta(hours=delta_hours)
-        if reminder_time <= now:
+
+        # Конвертируем в UTC для APScheduler
+        reminder_time_utc = reminder_time.astimezone(UTC)
+        now_utc = now.astimezone(UTC)
+
+        if reminder_time_utc <= now_utc:
+            logger.info(f"Skipping reminder {delta_hours}h: time passed ({reminder_time_utc} <= {now_utc})")
             continue
 
         job_id = f"{chat_id}_{name}_{start_dt.isoformat()}_{delta_hours}"
@@ -140,7 +162,7 @@ def schedule_reminders(chat_id, event_type, name, start_dt, end_dt, subject=None
 
         scheduler.add_job(
             send_telegram_message,
-            trigger=DateTrigger(run_date=reminder_time),
+            trigger=DateTrigger(run_date=reminder_time_utc),
             args=[chat_id, message],
             id=job_id,
             replace_existing=True
@@ -159,7 +181,7 @@ def schedule_reminders(chat_id, event_type, name, start_dt, end_dt, subject=None
             }
         }
         job_ids.append(job_id)
-        logger.info(f"Scheduled reminder: {job_id} at {reminder_time}")
+        logger.info(f"Scheduled reminder: {job_id} at {reminder_time_utc} UTC (local: {reminder_time})")
 
     return job_ids
 
@@ -178,28 +200,17 @@ def get_param(params, name, default=None):
     """Извлекает параметр из Dialogflow, обрабатывает объекты."""
     val = params.get(name, default)
     if isinstance(val, dict):
-        # Dialogflow иногда шлёт {"date_time": "2026-12-12T00:30:00+05:00"}
         if "date_time" in val:
             return val["date_time"]
         return val.get("name") or val.get("value") or str(val)
     return val
 
 def extract_datetime(params, date_key, time_key):
-    """Извлекает datetime из параметров Dialogflow.
-    Берёт дату из date_key и время из time_key, склеивает правильно."""
-    d = get_param(params, date_key)  # "2026-07-18T12:00:00+05:00"
-    t = get_param(params, time_key)  # "2026-07-17T14:44:00+05:00"
-
+    """Извлекает datetime из параметров Dialogflow с учётом часового пояса."""
+    d = get_param(params, date_key)
+    t = get_param(params, time_key)
     if d:
-        # Извлекаем дату (YYYY-MM-DD) из date
-        date_part = d.split('T')[0] if 'T' in str(d) else str(d)
-
-        # Извлекаем время (HH:MM:SS) из time
-        if t:
-            time_part = t.split('T')[1].split('+')[0].split('Z')[0] if 'T' in str(t) else str(t)
-            return parse_date_time(date_part, time_part)
-        else:
-            return parse_date_time(date_part, None)
+        return parse_date_time(d, t)
     return None
 
 # ===================== PARSER FROM TEXT =====================
@@ -552,11 +563,15 @@ def handle_cancel(params, query_text, chat_id):
 # ===================== HEALTH CHECK =====================
 @app.route('/health', methods=['GET'])
 def health():
+    now_local = datetime.now(USER_TIMEZONE)
+    now_utc = datetime.now(UTC)
     return jsonify({
         "status": "ok",
         "events_count": len(events),
         "scheduled_jobs": len(scheduled_jobs),
-        "bot_token_set": BOT_TOKEN != "NOT_SET"
+        "bot_token_set": BOT_TOKEN != "NOT_SET",
+        "local_time": now_local.strftime("%d.%m.%Y %H:%M:%S %Z"),
+        "utc_time": now_utc.strftime("%d.%m.%Y %H:%M:%S %Z")
     })
 
 @app.route('/')
