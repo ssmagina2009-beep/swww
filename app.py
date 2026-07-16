@@ -49,7 +49,7 @@ def parse_date_time(date_str, time_str):
             return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
 
         if time_str:
-            # Dialogflow time тоже может быть в ISO: 2026-07-17T12:30:00+05:00
+            # Dialogflow time тоже может быть в ISO: 2026-07-17T14:44:00+05:00
             if 'T' in time_str:
                 dt_str = time_str.split('+')[0].split('Z')[0]
                 return datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S")
@@ -185,11 +185,21 @@ def get_param(params, name, default=None):
     return val
 
 def extract_datetime(params, date_key, time_key):
-    """Извлекает datetime из параметров Dialogflow."""
-    d = get_param(params, date_key)
-    t = get_param(params, time_key)
+    """Извлекает datetime из параметров Dialogflow.
+    Берёт дату из date_key и время из time_key, склеивает правильно."""
+    d = get_param(params, date_key)  # "2026-07-18T12:00:00+05:00"
+    t = get_param(params, time_key)  # "2026-07-17T14:44:00+05:00"
+
     if d:
-        return parse_date_time(d, t)
+        # Извлекаем дату (YYYY-MM-DD) из date
+        date_part = d.split('T')[0] if 'T' in str(d) else str(d)
+
+        # Извлекаем время (HH:MM:SS) из time
+        if t:
+            time_part = t.split('T')[1].split('+')[0].split('Z')[0] if 'T' in str(t) else str(t)
+            return parse_date_time(date_part, time_part)
+        else:
+            return parse_date_time(date_part, None)
     return None
 
 # ===================== PARSER FROM TEXT =====================
