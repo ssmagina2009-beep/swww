@@ -464,9 +464,9 @@ def webhook():
     elif any(word in intent_name for word in ["ochistit", "clear", "udalit vse", "ubrat vse"]):
         return handle_clear_all(chat_id)
 
-    # --- RESCHEDULE / PERENESTI ---
-    elif any(word in intent_name for word in ["perenesti", "reschedule", "perenosit", "pomenuat", "izmenit vremya"]):
-        return handle_reschedule(params, query_text, chat_id, all_required_present, session)
+    # --- EDIT / CHANGE / MOVE ---
+    elif any(word in intent_name.lower() for word in ["izmen", "edit", "change", "perenes", "perenesti", "isprav", "pomenu", "pomenya", "reschedule", "perenosit"]):
+        return handle_edit(params, query_text, chat_id, session)
 
     # --- UNKNOWN ---
     logger.info(f"Unknown intent: {intent_name}")
