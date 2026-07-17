@@ -39,8 +39,7 @@ session_data = {}  # session_id -> {name, date, time, step}
 session_edit = {}  # session_id -> {event_index, field, step} для редактирования
 
 # ===================== DATA PERSISTENCE =====================
-def load_data()
-load_session_edit():
+def load_data():
     global events, session_chat_ids, session_data
 
     if os.path.exists(DATA_FILE):
