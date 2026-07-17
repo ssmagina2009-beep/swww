@@ -192,59 +192,14 @@ def get_main_keyboard():
 
 # ===================== CHAT ID MANAGEMENT =====================
 def get_chat_id(req, session_id):
-    if session_id in session_chat_ids:
-        return session_chat_ids[session_id]
-
-    output_contexts = req.get("queryResult", {}).get("outputContexts", [])
-    for ctx in output_contexts:
-        ctx_params = ctx.get("parameters", {})
-        for key in ["chat_id", "chatId", "from_id", "telegram_chat_id"]:
-            if key in ctx_params and ctx_params[key]:
-                try:
-                    cid = int(ctx_params[key])
-                    session_chat_ids[session_id] = cid
-                    save_chat_id_data()
-                    return cid
-                except:
-                    pass
-
-    orig = req.get("originalDetectIntentRequest", {})
-    payload = orig.get("payload", {})
-    telegram_data = payload.get("data", {})
-
-    if "message" in telegram_data:
-        chat_id = telegram_data["message"]["chat"]["id"]
-        session_chat_ids[session_id] = chat_id
-        save_chat_id_data()
-        return chat_id
-    elif "callback_query" in telegram_data:
-        chat_id = telegram_data["callback_query"]["message"]["chat"]["id"]
-        session_chat_ids[session_id] = chat_id
-        save_chat_id_data()
-        return chat_id
-
-    query_text = req.get("queryResult", {}).get("queryText", "")
-    chat_id_match = re.search(r'(?:мой\s+chat[-_]?id|chat[-_]?id|id)\s*[:=]?\s*(\d+)', query_text, re.IGNORECASE)
-    if chat_id_match:
-        cid = int(chat_id_match.group(1))
-        session_chat_ids[session_id] = cid
-        save_chat_id_data()
-        return cid
-
-    return None
+    """Возвращает chat_id пользователя. Бот работает только для одного пользователя."""
+    # Ваш chat_id — жёстко прописан
+    MY_CHAT_ID = 5241670548
+    return MY_CHAT_ID
 
 def ask_for_chat_id():
-    return jsonify({
-        "fulfillmentText": (
-            "🔑 Для работы мне нужен ваш chat_id из Telegram.\n\n"
-            "Как получить:\n"
-            "1. Откройте Telegram\n"
-            "2. Найдите бота @userinfobot\n"
-            "3. Напишите ему что-нибудь\n"
-            "4. Он пришлёт ваш ID (число, например 123456789)\n\n"
-            "Отправьте мне: <b>мой chat_id 123456789</b>"
-        )
-    })
+    """Больше не используется — chat_id прописан жёстко."""
+    return jsonify({"fulfillmentText": ""})
 
 # ===================== SCHEDULER =====================
 def schedule_reminders(chat_id, event_type, name, start_dt, end_dt, subject=None, level=None):
@@ -446,16 +401,7 @@ def webhook():
     session = req.get("session", "")
 
     chat_id = get_chat_id(req, session)
-
-    if not chat_id:
-        logger.warning(f"No chat_id found for session {session}, asking user")
-        return ask_for_chat_id()
-
-    try:
-        chat_id = int(chat_id)
-    except:
-        logger.error(f"Invalid chat_id: {chat_id}")
-        return ask_for_chat_id()
+    logger.info(f"Using chat_id: {chat_id}")
 
     logger.info(f"Intent: {intent_name}, ChatID: {chat_id}, Query: {query_text}")
     logger.info(f"Params: {json.dumps(params, ensure_ascii=False)}")
@@ -465,18 +411,6 @@ def webhook():
     overdue_sent = check_and_send_overdue_reminders(chat_id)
     if overdue_sent > 0:
         logger.info(f"Sent {overdue_sent} overdue reminders")
-
-    # --- CHAT ID SETUP ---
-    if "chat_id" in intent_name or "chatid" in intent_name or re.search(r'chat[-_]?id', query_text, re.IGNORECASE):
-        match = re.search(r'(\d{7,})', query_text)
-        if match:
-            new_chat_id = int(match.group(1))
-            session_chat_ids[session] = new_chat_id
-            save_chat_id_data()
-            send_telegram_message(new_chat_id, "✅ Chat_id сохранён! Теперь вы можете создавать события.")
-            return jsonify({"fulfillmentText": ""})
-        else:
-            return ask_for_chat_id()
 
     # --- GREETING / START ---
     if any(word in intent_name for word in ["privet", "start", "hello", "greeting", "welcome", "poka"]):
@@ -767,15 +701,15 @@ def health():
     now_local = datetime.now(USER_TIMEZONE)
     now_utc = datetime.now(UTC)
 
-    # Проверяем напоминания для ВСЕХ пользователей при каждом /health запросе
+    # Проверяем напоминания для вашего chat_id при каждом /health запросе
     # Это нужно для Render free tier — сервер засыпает, но cron-job.org будит его
+    MY_CHAT_ID = 5241670548
     total_sent = 0
-    for chat_id in list(session_chat_ids.values()):
-        try:
-            sent = check_and_send_overdue_reminders(int(chat_id))
-            total_sent += sent
-        except Exception as e:
-            logger.error(f"Error checking reminders for {chat_id}: {e}")
+    try:
+        sent = check_and_send_overdue_reminders(MY_CHAT_ID)
+        total_sent += sent
+    except Exception as e:
+        logger.error(f"Error checking reminders: {e}")
 
     if total_sent > 0:
         logger.info(f"Health check sent {total_sent} overdue reminders")
@@ -784,7 +718,6 @@ def health():
         "status": "ok",
         "events_count": len(events),
         "scheduled_jobs": len(scheduled_jobs),
-        "chat_ids_saved": len(session_chat_ids),
         "bot_token_set": BOT_TOKEN != "NOT_SET",
         "local_time": now_local.strftime("%d.%m.%Y %H:%M:%S %Z"),
         "utc_time": now_utc.strftime("%d.%m.%Y %H:%M:%S %Z"),
