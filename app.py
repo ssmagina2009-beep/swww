@@ -542,47 +542,38 @@ def handle_reminder(params, query_text, chat_id, all_required_present, session_i
     return jsonify({"fulfillmentText": ""})
 
 def handle_olympiad(params, query_text, chat_id, all_required_present, session_id):
-    """Обрабатывает создание олимпиады с slot filling."""
+    """Обрабатывает создание олимпиады. ВСЕГДА парсит из queryText для точности."""
 
-    sd = get_slot_filling_data(session_id, params, query_text, "olympiad")
+    # ВСЕГДА парсим из текста пользователя — так надёжнее Dialogflow params
+    p_name, p_start, p_end, p_subj, p_lvl = parse_olympiad_from_text(query_text)
 
-    if not all_required_present:
-        logger.info(f"Olympiad slot filling step {sd['step']}")
-        return jsonify({"fulfillmentText": ""})
+    # Fallback: берём из params если из текста не получилось
+    name = p_name or get_param(params, "any") or "Олимпиада"
+    subject = p_subj or get_param(params, "subject") or ""
+    level = p_lvl or get_param(params, "level") or "1"
+    start_dt = p_start
+    end_dt = p_end
 
-    # Используем сохранённые данные
-    name = sd.get("name") or get_param(params, "any")
-    subject = get_param(params, "subject")
-    level = get_param(params, "level")
-    start_date = sd.get("date") or get_param(params, "FROM")
-    end_date = get_param(params, "to")
+    # Если из текста не получилось даты — пробуем из params
+    if not start_dt:
+        start_date = get_param(params, "FROM")
+        if start_date:
+            start_dt = parse_date_time(start_date, None)
+    if not end_dt:
+        end_date = get_param(params, "to")
+        if end_date:
+            end_dt = parse_date_time(end_date, None)
 
-    start_dt = parse_date_time(start_date, None) if start_date else None
-    end_dt = parse_date_time(end_date, None) if end_date else None
-
-    # Fallback: парсим из текста
-    if not name or not start_dt or not end_dt or not subject or not level:
-        p_name, p_start, p_end, p_subj, p_lvl = parse_olympiad_from_text(query_text)
-        if p_name and not name: name = p_name
-        if p_start and not start_dt: start_dt = p_start
-        if p_end and not end_dt: end_dt = p_end
-        if p_subj and not subject: subject = p_subj
-        if p_lvl and not level: level = p_lvl
-
+    # Если время не указано (только дата) — ставим дефолтное
     if start_dt and start_dt.hour == 0 and start_dt.minute == 0:
         start_dt = start_dt.replace(hour=9, minute=0)
     if end_dt and end_dt.hour == 0 and end_dt.minute == 0:
         end_dt = end_dt.replace(hour=14, minute=0)
 
-    if not name or not start_dt or not end_dt:
+    if not start_dt or not end_dt:
         missing = []
-        if not name: missing.append("название")
         if not start_dt: missing.append("дату начала")
         if not end_dt: missing.append("дату окончания")
-        if not subject: missing.append("предмет")
-        if not level: missing.append("уровень")
-
-        reset_session_data(session_id)
         return jsonify({"fulfillmentText": f"Укажите {', '.join(missing)} олимпиады."})
 
     job_ids = schedule_reminders(chat_id, "olympiad", name, start_dt, end_dt, subject, level)
@@ -605,7 +596,6 @@ def handle_olympiad(params, query_text, chat_id, all_required_present, session_i
     logger.info(f"Olympiad created: {response_text}")
 
     send_telegram_message(chat_id, f"✅ {response_text}")
-    reset_session_data(session_id)
 
     return jsonify({"fulfillmentText": ""})
 
