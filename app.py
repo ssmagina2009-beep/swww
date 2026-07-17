@@ -766,6 +766,20 @@ def handle_clear_all(chat_id):
 def health():
     now_local = datetime.now(USER_TIMEZONE)
     now_utc = datetime.now(UTC)
+
+    # Проверяем напоминания для ВСЕХ пользователей при каждом /health запросе
+    # Это нужно для Render free tier — сервер засыпает, но cron-job.org будит его
+    total_sent = 0
+    for chat_id in list(session_chat_ids.values()):
+        try:
+            sent = check_and_send_overdue_reminders(int(chat_id))
+            total_sent += sent
+        except Exception as e:
+            logger.error(f"Error checking reminders for {chat_id}: {e}")
+
+    if total_sent > 0:
+        logger.info(f"Health check sent {total_sent} overdue reminders")
+
     return jsonify({
         "status": "ok",
         "events_count": len(events),
@@ -773,7 +787,8 @@ def health():
         "chat_ids_saved": len(session_chat_ids),
         "bot_token_set": BOT_TOKEN != "NOT_SET",
         "local_time": now_local.strftime("%d.%m.%Y %H:%M:%S %Z"),
-        "utc_time": now_utc.strftime("%d.%m.%Y %H:%M:%S %Z")
+        "utc_time": now_utc.strftime("%d.%m.%Y %H:%M:%S %Z"),
+        "reminders_sent": total_sent
     })
 
 @app.route('/')
