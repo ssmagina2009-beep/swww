@@ -36,9 +36,11 @@ events = []
 scheduled_jobs = {}
 session_chat_ids = {}
 session_data = {}  # session_id -> {name, date, time, step}
+session_edit = {}  # session_id -> {event_index, field, step} для редактирования
 
 # ===================== DATA PERSISTENCE =====================
-def load_data():
+def load_data()
+load_session_edit():
     global events, session_chat_ids, session_data
 
     if os.path.exists(DATA_FILE):
@@ -105,7 +107,25 @@ def save_session_data():
     except Exception as e:
         logger.error(f"Failed to save session data: {e}")
 
+def save_session_edit():
+    try:
+        with open("session_edit.json", 'w', encoding='utf-8') as f:
+            json.dump({"sessions": session_edit}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save session edit: {e}")
+
+def load_session_edit():
+    global session_edit
+    if os.path.exists("session_edit.json"):
+        try:
+            with open("session_edit.json", 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                session_edit = data.get("sessions", {})
+        except Exception as e:
+            logger.error(f"Failed to load session edit: {e}")
+
 load_data()
+load_session_edit()
 
 # ===================== SCHEDULER =====================
 scheduler = BackgroundScheduler(timezone=UTC)
@@ -184,6 +204,7 @@ def get_main_keyboard():
             [{"text": "📅 Создать событие"}],
             [{"text": "🏆 Новая олимпиада"}],
             [{"text": "🗑 Удалить событие"}],
+            [{"text": "🔄 Перенести событие"}],
             [{"text": "📋 Список событий"}],
             [{"text": "🧹 Очистить всё"}]
         ],
@@ -376,6 +397,14 @@ def get_slot_filling_data(session_id, params, query_text, intent_name):
     save_session_data()
     return sd
 
+def find_event_by_name(chat_id, name):
+    """Находит событие по названию для данного пользователя."""
+    for i, event in enumerate(events):
+        if event["chat_id"] == chat_id:
+            if name.lower() in event["name"].lower() or event["name"].lower() in name.lower():
+                return i, event
+    return None, None
+
 def reset_session_data(session_id):
     """Сбрасывает данные сессии после создания события."""
     if session_id in session_data:
@@ -435,6 +464,10 @@ def webhook():
     # --- CLEAR ALL ---
     elif any(word in intent_name for word in ["ochistit", "clear", "udalit vse", "ubrat vse"]):
         return handle_clear_all(chat_id)
+
+    # --- RESCHEDULE / PERENESTI ---
+    elif any(word in intent_name for word in ["perenesti", "reschedule", "perenosit", "pomenuat", "izmenit vremya"]):
+        return handle_reschedule(params, query_text, chat_id, all_required_present, session)
 
     # --- UNKNOWN ---
     logger.info(f"Unknown intent: {intent_name}")
@@ -683,6 +716,325 @@ def handle_clear_all(chat_id):
     save_data()
 
     send_telegram_message(chat_id, "🧹 Все события удалены!")
+    return jsonify({"fulfillmentText": ""})
+
+def handle_edit(params, query_text, chat_id, session_id):
+    """Обрабатывает редактирование события/олимпиады."""
+
+    # Инициализируем или получаем текущее состояние редактирования
+    if session_id not in session_edit:
+        session_edit[session_id] = {"step": "ask_name", "event_index": None, "field": None}
+
+    se = session_edit[session_id]
+
+    # Шаг 1: Спрашиваем название события
+    if se["step"] == "ask_name":
+        # Проверяем, не указал ли пользователь название сразу
+        name = get_param(params, "any") or query_text.strip()
+
+        # Ищем событие
+        idx, event = find_event_by_name(chat_id, name)
+
+        if idx is None:
+            send_telegram_message(chat_id, "❌ Не нашёл событие. Попробуйте изменить снова.")
+            del session_edit[session_id]
+            save_session_edit()
+            return jsonify({"fulfillmentText": ""})
+
+        se["event_index"] = idx
+        se["step"] = "ask_field"
+        save_session_edit()
+
+        event_type = "событие" if event["event_type"] == "event" else "олимпиада"
+        start_str = format_dt(event["start_dt"]) if isinstance(event["start_dt"], datetime) else format_dt(datetime.fromisoformat(event["start_dt"]))
+        end_str = format_dt(event["end_dt"]) if isinstance(event["end_dt"], datetime) else format_dt(datetime.fromisoformat(event["end_dt"]))
+
+        # Формируем список доступных полей
+        if event["event_type"] == "event":
+            fields_text = "название, дата начала, время начала, дата конца, время конца"
+        else:
+            fields_text = "название, дата начала, время начала, дата конца, время конца, предмет, уровень"
+
+        send_telegram_message(chat_id, 
+            f"✏️ Найдено {event_type} «{event['name']}»\n"
+            f"📅 {start_str} — {end_str}\n\n"
+            f"Что вы хотите изменить? ({fields_text})")
+        return jsonify({"fulfillmentText": ""})
+
+    # Шаг 2: Пользователь выбирает поле для изменения
+    elif se["step"] == "ask_field":
+        field_map = {
+            "название": "name", "имя": "name", "name": "name",
+            "дата начала": "start_date", "дата": "start_date", "date": "start_date",
+            "время начала": "start_time", "время": "start_time", "time": "start_time",
+            "дата конца": "end_date", "конец дата": "end_date",
+            "время конца": "end_time", "конец время": "end_time",
+            "предмет": "subject", "subject": "subject",
+            "уровень": "level", "level": "level"
+        }
+
+        field = None
+        query_lower = query_text.lower()
+        for key, val in field_map.items():
+            if key in query_lower:
+                field = val
+                break
+
+        if not field:
+            send_telegram_message(chat_id, "Не понял, что изменить. Попробуйте: название, дата, время, предмет или уровень.")
+            return jsonify({"fulfillmentText": ""})
+
+        se["field"] = field
+        se["step"] = "ask_value"
+        save_session_edit()
+
+        # Спрашиваем новое значение
+        field_names = {
+            "name": "название", "start_date": "дату начала", "start_time": "время начала",
+            "end_date": "дату конца", "end_time": "время конца", "subject": "предмет", "level": "уровень"
+        }
+        send_telegram_message(chat_id, f"Введите новое {field_names.get(field, field)}:")
+        return jsonify({"fulfillmentText": ""})
+
+    # Шаг 3: Пользователь вводит новое значение
+    elif se["step"] == "ask_value":
+        idx = se["event_index"]
+        field = se["field"]
+        event = events[idx]
+
+        # Применяем изменение
+        success = apply_edit(event, field, query_text)
+
+        if not success:
+            send_telegram_message(chat_id, "❌ Не удалось распознать значение. Попробуйте ещё раз.")
+            return jsonify({"fulfillmentText": ""})
+
+        # Пересоздаём напоминания
+        remove_reminder_jobs(event["job_ids"])
+
+        start_dt = event["start_dt"]
+        end_dt = event["end_dt"]
+        if isinstance(start_dt, str):
+            start_dt = datetime.fromisoformat(start_dt)
+        if isinstance(end_dt, str):
+            end_dt = datetime.fromisoformat(end_dt)
+
+        new_job_ids = schedule_reminders(
+            chat_id, 
+            event["event_type"], 
+            event["name"], 
+            start_dt, 
+            end_dt,
+            event.get("subject"),
+            event.get("level")
+        )
+        event["job_ids"] = new_job_ids
+        event["sent_reminders"] = []
+
+        save_data()
+
+        # Отправляем подтверждение
+        start_str = format_dt(start_dt)
+        end_str = format_dt(end_dt)
+
+        if event["event_type"] == "olympiad":
+            send_telegram_message(chat_id, 
+                f"✅ Олимпиада изменена!\n"
+                f"«{event['name']}» {event.get('subject', '')} {event.get('level', '')} уровня\n"
+                f"📅 {start_str} — {end_str}")
+        else:
+            send_telegram_message(chat_id, 
+                f"✅ Событие изменено!\n"
+                f"«{event['name']}»\n"
+                f"📅 {start_str} — {end_str}")
+
+        # Сбрасываем состояние
+        del session_edit[session_id]
+        save_session_edit()
+
+        return jsonify({"fulfillmentText": ""})
+
+    return jsonify({"fulfillmentText": ""})
+
+def apply_edit(event, field, value):
+    """Применяет изменение к событию."""
+    try:
+        if field == "name":
+            event["name"] = value.strip()
+            return True
+
+        elif field == "start_date":
+            new_date = parse_date_time(value, None)
+            if new_date:
+                old_time = event["start_dt"]
+                if isinstance(old_time, str):
+                    old_time = datetime.fromisoformat(old_time)
+                event["start_dt"] = new_date.replace(hour=old_time.hour, minute=old_time.minute)
+                return True
+            return False
+
+        elif field == "start_time":
+            time_match = re.search(r'(\d{1,2}):(\d{2})', value)
+            if time_match:
+                h, m = int(time_match.group(1)), int(time_match.group(2))
+                dt = event["start_dt"]
+                if isinstance(dt, str):
+                    dt = datetime.fromisoformat(dt)
+                event["start_dt"] = dt.replace(hour=h, minute=m)
+                return True
+            return False
+
+        elif field == "end_date":
+            new_date = parse_date_time(value, None)
+            if new_date:
+                old_time = event["end_dt"]
+                if isinstance(old_time, str):
+                    old_time = datetime.fromisoformat(old_time)
+                event["end_dt"] = new_date.replace(hour=old_time.hour, minute=old_time.minute)
+                return True
+            return False
+
+        elif field == "end_time":
+            time_match = re.search(r'(\d{1,2}):(\d{2})', value)
+            if time_match:
+                h, m = int(time_match.group(1)), int(time_match.group(2))
+                dt = event["end_dt"]
+                if isinstance(dt, str):
+                    dt = datetime.fromisoformat(dt)
+                event["end_dt"] = dt.replace(hour=h, minute=m)
+                return True
+            return False
+
+        elif field == "subject":
+            event["subject"] = value.strip()
+            return True
+
+        elif field == "level":
+            if value.strip() in ['1', '2', '3']:
+                event["level"] = value.strip()
+                return True
+            return False
+
+        return False
+    except Exception as e:
+        logger.error(f"Apply edit error: {e}")
+        return False
+
+def handle_reschedule(params, query_text, chat_id, all_required_present, session_id):
+    """Переносит событие или олимпиаду на новое время."""
+
+    # Парсим из текста: "перенести Название 17.07.2026 11:06 на 18.07.2026 12:00"
+    # Или: "перенести Название 17.07.2026 на 18.07.2026"
+
+    # Убираем слово "перенести" и варианты
+    cleaned = re.sub(r'^(перенести|перенеси|поменять|изменить|сдвинуть|reschedule)\s+', '', query_text, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s+(перенести|перенеси|поменять|изменить|сдвинуть|reschedule)\s+', ' ', cleaned, flags=re.IGNORECASE)
+
+    # Ищем ключевое слово "на" — разделитель старой и новой даты
+    parts = cleaned.split(' на ')
+    if len(parts) < 2:
+        parts = cleaned.split(' на ')
+
+    if len(parts) < 2:
+        # Пробуем найти "на" без пробелов или другие варианты
+        match = re.search(r'(.+?)\s+(на|->|→)\s+(.+)', cleaned)
+        if match:
+            old_part = match.group(1).strip()
+            new_part = match.group(3).strip()
+        else:
+            send_telegram_message(chat_id, "❌ Формат: перенести Название дд.мм.гггг чч:мм на дд.мм.гггг чч:мм")
+            return jsonify({"fulfillmentText": ""})
+    else:
+        old_part = parts[0].strip()
+        new_part = parts[1].strip()
+
+    logger.info(f"Reschedule: old='{old_part}', new='{new_part}'")
+
+    # Парсим старую дату из old_part
+    old_date_match = re.search(r'(\d{1,2}\.\d{1,2}\.\d{4}(?:\s+\d{1,2}:\d{2})?)', old_part)
+    old_date_str = old_date_match.group(1) if old_date_match else None
+    old_dt = parse_from_text(old_date_str) if old_date_str else None
+
+    # Название — всё до даты
+    name = old_part
+    if old_date_match:
+        name = old_part[:old_date_match.start()].strip()
+    # Убираем лишние слова из начала
+    name = re.sub(r'^(событие|олимпиада|напоминание)\s+', '', name, flags=re.IGNORECASE).strip()
+
+    # Парсим новую дату из new_part
+    new_date_match = re.search(r'(\d{1,2}\.\d{1,2}\.\d{4}(?:\s+\d{1,2}:\d{2})?)', new_part)
+    new_date_str = new_date_match.group(1) if new_date_match else None
+    new_dt = parse_from_text(new_date_str) if new_date_str else None
+
+    if not name:
+        send_telegram_message(chat_id, "❌ Укажите название события.")
+        return jsonify({"fulfillmentText": ""})
+
+    if not old_dt:
+        send_telegram_message(chat_id, "❌ Укажите текущую дату события.")
+        return jsonify({"fulfillmentText": ""})
+
+    if not new_dt:
+        send_telegram_message(chat_id, "❌ Укажите новую дату.")
+        return jsonify({"fulfillmentText": ""})
+
+    # Ищем событие
+    found = False
+    for i, event in enumerate(events):
+        if event["chat_id"] != chat_id:
+            continue
+
+        title_match = name.lower() in event["name"].lower() or event["name"].lower() in name.lower()
+
+        event_dt = event["start_dt"]
+        if isinstance(event_dt, str):
+            event_dt = datetime.fromisoformat(event_dt)
+
+        date_match = (event_dt.strftime("%d.%m.%Y") == old_dt.strftime("%d.%m.%Y"))
+
+        if title_match and date_match:
+            # Удаляем старые напоминания
+            remove_reminder_jobs(event["job_ids"])
+
+            # Обновляем время
+            old_start = event["start_dt"]
+            if isinstance(old_start, str):
+                old_start = datetime.fromisoformat(old_start)
+            old_end = event["end_dt"]
+            if isinstance(old_end, str):
+                old_end = datetime.fromisoformat(old_end)
+
+            # Считаем разницу между старым началом и концом
+            duration = old_end - old_start
+
+            event["start_dt"] = new_dt
+            event["end_dt"] = new_dt + duration
+            event["sent_reminders"] = []  # Сбрасываем отправленные напоминания
+
+            # Создаём новые напоминания
+            job_ids = schedule_reminders(
+                chat_id,
+                event["event_type"],
+                event["name"],
+                event["start_dt"],
+                event["end_dt"],
+                event.get("subject"),
+                event.get("level")
+            )
+            event["job_ids"] = job_ids
+
+            save_data()
+
+            event_type = "событие" if event["event_type"] == "event" else "олимпиада"
+            response_text = (f"Перенёс {event_type} «{event['name']}»\n"
+                           f"С {format_dt(old_start)} на {format_dt(new_dt)}")
+
+            logger.info(f"Rescheduled: {response_text}")
+            send_telegram_message(chat_id, f"✅ {response_text}")
+            return jsonify({"fulfillmentText": ""})
+
+    send_telegram_message(chat_id, f"❌ Не нашёл событие «{name}» на {format_dt(old_dt)}")
     return jsonify({"fulfillmentText": ""})
 
 # ===================== HEALTH CHECK =====================
