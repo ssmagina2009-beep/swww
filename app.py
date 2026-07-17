@@ -12,17 +12,14 @@ import pytz
 
 # ===================== SETTINGS =====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "NOT_SET")
-
-# Часовой пояс пользователя (UTC+5 — Екатеринбург)
 USER_TIMEZONE = pytz.timezone('Asia/Yekaterinburg')
 UTC = pytz.UTC
-
-# Reminder times (hours before event)
 REMINDER_DELTAS = [168, 48, 24, 0]
 
 # ===================== FILES =====================
 DATA_FILE = "bot_data.json"
 CHAT_ID_FILE = "chat_id.json"
+SESSION_DATA_FILE = "session_data.json"
 
 # ===================== LOGGING =====================
 logging.basicConfig(
@@ -38,10 +35,12 @@ app = Flask(__name__)
 events = []
 scheduled_jobs = {}
 session_chat_ids = {}
+session_data = {}  # session_id -> {name, date, time, step}
 
 # ===================== DATA PERSISTENCE =====================
 def load_data():
-    global events, session_chat_ids
+    global events, session_chat_ids, session_data
+
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
@@ -52,7 +51,6 @@ def load_data():
                         ev["start_dt"] = datetime.fromisoformat(ev["start_dt"])
                     if isinstance(ev.get("end_dt"), str):
                         ev["end_dt"] = datetime.fromisoformat(ev["end_dt"])
-                    # Инициализируем sent_reminders если нет
                     if "sent_reminders" not in ev:
                         ev["sent_reminders"] = []
                 logger.info(f"Loaded {len(events)} events from {DATA_FILE}")
@@ -67,6 +65,15 @@ def load_data():
                 logger.info(f"Loaded {len(session_chat_ids)} chat_ids")
         except Exception as e:
             logger.error(f"Failed to load chat_ids: {e}")
+
+    if os.path.exists(SESSION_DATA_FILE):
+        try:
+            with open(SESSION_DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                session_data = data.get("sessions", {})
+                logger.info(f"Loaded {len(session_data)} session data entries")
+        except Exception as e:
+            logger.error(f"Failed to load session data: {e}")
 
 def save_data():
     try:
@@ -90,6 +97,13 @@ def save_chat_id_data():
             json.dump({"chat_ids": session_chat_ids}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"Failed to save chat_ids: {e}")
+
+def save_session_data():
+    try:
+        with open(SESSION_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"sessions": session_data}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save session data: {e}")
 
 load_data()
 
@@ -179,9 +193,7 @@ def get_main_keyboard():
 # ===================== CHAT ID MANAGEMENT =====================
 def get_chat_id(req, session_id):
     if session_id in session_chat_ids:
-        chat_id = session_chat_ids[session_id]
-        logger.info(f"Found saved chat_id for session: {chat_id}")
-        return chat_id
+        return session_chat_ids[session_id]
 
     output_contexts = req.get("queryResult", {}).get("outputContexts", [])
     for ctx in output_contexts:
@@ -217,7 +229,6 @@ def get_chat_id(req, session_id):
         cid = int(chat_id_match.group(1))
         session_chat_ids[session_id] = cid
         save_chat_id_data()
-        logger.info(f"Extracted chat_id from text: {cid}")
         return cid
 
     return None
@@ -300,10 +311,6 @@ def remove_reminder_jobs(job_ids):
             del scheduled_jobs[job_id]
 
 def check_and_send_overdue_reminders(chat_id):
-    """
-    Проверяет просроченные напоминания и отправляет их ТОЛЬКО ОДИН РАЗ.
-    Использует sent_reminders в событии, чтобы не дублировать.
-    """
     now = datetime.now(USER_TIMEZONE)
     sent = 0
 
@@ -315,20 +322,16 @@ def check_and_send_overdue_reminders(chat_id):
         if isinstance(start_dt, str):
             start_dt = datetime.fromisoformat(start_dt)
 
-        # Инициализируем sent_reminders если нет
         if "sent_reminders" not in event:
             event["sent_reminders"] = []
 
         for delta_hours in REMINDER_DELTAS:
             reminder_time = start_dt - timedelta(hours=delta_hours)
 
-            # Проверяем, не отправляли ли уже это напоминание
             if delta_hours in event["sent_reminders"]:
                 continue
 
-            # Если напоминание должно было сработать
             if now >= reminder_time:
-                # Но событие ещё не сильно прошло (в пределах 2 часов после)
                 if now <= start_dt + timedelta(hours=2):
                     hours_text = str(delta_hours) if delta_hours > 0 else "0"
                     start_str = format_dt(start_dt)
@@ -351,7 +354,7 @@ def check_and_send_overdue_reminders(chat_id):
                         logger.info(f"Sent overdue reminder: {delta_hours}h for {event['name']}")
 
     if sent > 0:
-        save_data()  # Сохраняем sent_reminders
+        save_data()
 
     return sent
 
@@ -371,78 +374,58 @@ def extract_datetime(params, date_key, time_key):
         return parse_date_time(d, t)
     return None
 
-# ===================== PARSER FROM TEXT =====================
-def parse_event_from_text(text):
-    cleaned = re.sub(r'^(создать|сделать|создай|сделай|напоминание|событие|event|reminder|добавить|новое|создать событие|создать напоминание)\s+', '', text, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\s+(создать|сделать|создай|сделай|напоминание|событие|event|reminder)\s+', ' ', cleaned, flags=re.IGNORECASE)
+# ===================== SLOT FILLING HELPERS =====================
+def get_slot_filling_data(session_id, params, query_text, intent_name):
+    """
+    Собирает данные из slot filling пошагово.
+    Сохраняет промежуточные данные в session_data.
+    """
+    # Инициализируем session_data если нет
+    if session_id not in session_data:
+        session_data[session_id] = {"step": 0, "name": None, "date": None, "time": None}
 
-    patterns = [
-        (r'(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})', True),
-        (r'(\d{1,2}\.\d{1,2}\.\d{2})\s+(\d{1,2}:\d{2})', True),
-        (r'(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})', True),
-        (r'(\d{1,2}\/\d{1,2}\/\d{4})\s+(\d{1,2}:\d{2})', True),
-        (r'(\d{1,2}\.\d{1,2}\.\d{4})', False),
-        (r'(\d{1,2}\.\d{1,2}\.\d{2})', False),
-        (r'(\d{4}-\d{2}-\d{2})', False),
-    ]
+    sd = session_data[session_id]
 
-    start_dt = None
-    title = cleaned.strip()
+    # Определяем, на каком шаге мы находимся
+    # Шаг 0: только что начали, params пустые
+    # Шаг 1: есть name, нет date
+    # Шаг 2: есть name и date, нет time
+    # Шаг 3: все параметры собраны
 
-    for pattern, has_time in patterns:
-        match = re.search(pattern, cleaned)
-        if match:
-            if has_time:
-                start_dt = parse_date_time(match.group(1), match.group(2))
-            else:
-                start_dt = parse_date_time(match.group(1), None)
+    name_param = get_param(params, "name")
+    date_param = get_param(params, "date")
+    time_param = get_param(params, "time")
 
-            if start_dt:
-                title = cleaned[:match.start()].strip()
-                title = re.sub(r'^(создать|сделать|создай|сделай|напоминание|событие|event|reminder|добавить|новое)\s+', '', title, flags=re.IGNORECASE)
-                break
+    logger.info(f"Slot filling check: name={name_param}, date={date_param}, time={time_param}, step={sd['step']}")
 
-    return title, start_dt
+    # Если name пришло и оно не похоже на дату/время — сохраняем
+    if name_param and sd["step"] == 0:
+        # Проверяем, что name не является датой или временем
+        if not re.match(r'^\d{1,2}[.:]\d{2}$', str(name_param)) and not re.match(r'^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}$', str(name_param)):
+            sd["name"] = str(name_param)
+            sd["step"] = 1
+            logger.info(f"Saved name: {sd['name']}")
 
-def parse_olympiad_from_text(text):
-    cleaned = re.sub(r'^олимпиада\s+', '', text, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\s+олимпиада\s+', ' ', cleaned, flags=re.IGNORECASE)
+    # Если date пришло — сохраняем
+    if date_param and sd["step"] >= 1:
+        sd["date"] = str(date_param)
+        sd["step"] = 2
+        logger.info(f"Saved date: {sd['date']}")
 
-    date_pattern = r'(\d{1,2}\.\d{1,2}\.\d{4})'
-    dates = re.findall(date_pattern, cleaned)
+    # Если time пришло — сохраняем
+    if time_param and sd["step"] >= 2:
+        sd["time"] = str(time_param)
+        sd["step"] = 3
+        logger.info(f"Saved time: {sd['time']}")
 
-    start_dt = parse_date_time(dates[0], None) if len(dates) > 0 else None
-    end_dt = parse_date_time(dates[1], None) if len(dates) > 1 else None
+    save_session_data()
+    return sd
 
-    temp_text = re.sub(date_pattern, '', cleaned, count=2)
-    parts = [p.strip() for p in temp_text.split() if p.strip()]
-
-    level = None
-    if parts and parts[-1] in ['1', '2', '3']:
-        level = parts[-1]
-        parts = parts[:-1]
-
-    subject = ""
-    if parts:
-        subjects = ["математика", "физика", "химия", "биология", "информатика", 
-                    "русский", "английский", "история", "обществознание", "литература",
-                    "география", "астрономия", "экология", "технология"]
-        for i in range(len(parts)):
-            for subj in subjects:
-                if subj in parts[i].lower():
-                    subject = parts[i]
-                    parts = parts[:i] + parts[i+1:]
-                    break
-            if subject:
-                break
-
-        if not subject and parts:
-            subject = parts[-1]
-            parts = parts[:-1]
-
-    title = ' '.join(parts) if parts else "Олимпиада"
-
-    return title, start_dt, end_dt, subject, level
+def reset_session_data(session_id):
+    """Сбрасывает данные сессии после создания события."""
+    if session_id in session_data:
+        session_data[session_id] = {"step": 0, "name": None, "date": None, "time": None}
+        save_session_data()
 
 # ===================== WEBHOOK =====================
 @app.route('/render', methods=['POST'])
@@ -478,7 +461,7 @@ def webhook():
     logger.info(f"Params: {json.dumps(params, ensure_ascii=False)}")
     logger.info(f"allRequiredParamsPresent: {all_required_present}")
 
-    # Проверяем просроченные напоминания (теперь без дублей!)
+    # Проверяем просроченные напоминания
     overdue_sent = check_and_send_overdue_reminders(chat_id)
     if overdue_sent > 0:
         logger.info(f"Sent {overdue_sent} overdue reminders")
@@ -491,7 +474,7 @@ def webhook():
             session_chat_ids[session] = new_chat_id
             save_chat_id_data()
             send_telegram_message(new_chat_id, "✅ Chat_id сохранён! Теперь вы можете создавать события.")
-            return jsonify({"fulfillmentText": "Chat_id сохранён!"})
+            return jsonify({"fulfillmentText": ""})
         else:
             return ask_for_chat_id()
 
@@ -501,11 +484,11 @@ def webhook():
 
     # --- REMINDER / EVENT ---
     if any(word in intent_name for word in ["napomin", "reminder", "sobytie", "event", "sozdat", "dobavit"]):
-        return handle_reminder(params, query_text, chat_id, all_required_present)
+        return handle_reminder(params, query_text, chat_id, all_required_present, session)
 
     # --- OLYMPIAD ---
     elif any(word in intent_name for word in ["olimpiad", "olympiad"]):
-        return handle_olympiad(params, query_text, chat_id, all_required_present)
+        return handle_olympiad(params, query_text, chat_id, all_required_present, session)
 
     # --- CANCEL / DELETE ---
     elif any(word in intent_name for word in ["otmen", "cancel", "delete", "udal", "ubrat"]):
@@ -529,8 +512,8 @@ def handle_greeting(chat_id):
     welcome_text = (
         "👋 Привет! Я бот для напоминаний!\n\n"
         "📌 <b>Команды:</b>\n"
-        "• 📅 Создать событие — напишите: создать событие Название дд.мм.гггг чч:мм\n"
-        "• 🏆 Новая олимпиада — напишите: олимпиада Название дд.мм.гггг дд.мм.гггг Предмет Уровень\n"
+        "• 📅 Создать событие — напишите: создать событие\n"
+        "• 🏆 Новая олимпиада — напишите: олимпиада\n"
         "• 🗑 Удалить событие — напишите: удалить Название дд.мм.гггг\n"
         "• 📋 Список событий\n"
         "• 🧹 Очистить всё\n\n"
@@ -539,27 +522,49 @@ def handle_greeting(chat_id):
     send_telegram_message(chat_id, welcome_text, get_main_keyboard())
     return jsonify({"fulfillmentText": ""})
 
-def handle_reminder(params, query_text, chat_id, all_required_present):
+def handle_reminder(params, query_text, chat_id, all_required_present, session_id):
+    """Обрабатывает создание события с slot filling."""
+
+    # Собираем данные из slot filling
+    sd = get_slot_filling_data(session_id, params, query_text, "event")
+
     # Если Dialogflow ещё собирает параметры — не создаём событие
     if not all_required_present:
-        logger.info("Slot filling in progress, not creating event yet")
+        logger.info(f"Slot filling step {sd['step']}: name={sd['name']}, date={sd['date']}, time={sd['time']}")
         return jsonify({"fulfillmentText": ""})
 
-    # Пробуем получить из параметров Dialogflow
-    name = get_param(params, "name")
-    start_dt = extract_datetime(params, "date", "time")
+    # Все параметры собраны — используем сохранённые данные из session_data
+    # Название берём из session_data (первый ответ), а не из params (последний ответ)
+    name = sd.get("name")
+    date_str = sd.get("date")
+    time_str = sd.get("time")
 
-    # Fallback: парсим из текста (ВСЕГДА парсим из текста для надёжности)
-    parsed_name, parsed_dt = parse_event_from_text(query_text)
-    if parsed_name:
-        name = parsed_name
-    if parsed_dt:
-        start_dt = parsed_dt
+    # Fallback: если в session_data нет — берём из params
+    if not name:
+        name = get_param(params, "name")
+    if not date_str:
+        date_str = get_param(params, "date")
+    if not time_str:
+        time_str = get_param(params, "time")
+
+    # Парсим дату и время
+    start_dt = None
+    if date_str and time_str:
+        start_dt = parse_date_time(date_str, time_str)
+    elif date_str:
+        start_dt = parse_date_time(date_str, None)
+
+    # Fallback: парсим из текста
+    if not start_dt:
+        parsed_name, parsed_dt = parse_event_from_text(query_text)
+        if parsed_dt:
+            start_dt = parsed_dt
 
     # Если всё ещё не хватает — ошибка
     if not name or not start_dt:
-        logger.warning(f"Missing params: name={name}, start_dt={start_dt}")
-        return jsonify({"fulfillmentText": "Не удалось распознать данные. Попробуйте: создать событие Название дд.мм.гггг чч:мм"})
+        logger.warning(f"Missing data: name={name}, start_dt={start_dt}")
+        reset_session_data(session_id)
+        return jsonify({"fulfillmentText": "Не удалось распознать данные. Попробуйте ещё раз."})
 
     # Парсим дату окончания из текста
     end_dt = None
@@ -587,7 +592,7 @@ def handle_reminder(params, query_text, chat_id, all_required_present):
         "subject": None,
         "level": None,
         "job_ids": job_ids,
-        "sent_reminders": [],  # Отслеживаем отправленные напоминания
+        "sent_reminders": [],
     }
     events.append(event_data)
     save_data()
@@ -597,29 +602,38 @@ def handle_reminder(params, query_text, chat_id, all_required_present):
 
     send_telegram_message(chat_id, f"✅ {response_text}")
 
+    # Сбрасываем session_data
+    reset_session_data(session_id)
+
     return jsonify({"fulfillmentText": ""})
 
-def handle_olympiad(params, query_text, chat_id, all_required_present):
+def handle_olympiad(params, query_text, chat_id, all_required_present, session_id):
+    """Обрабатывает создание олимпиады с slot filling."""
+
+    sd = get_slot_filling_data(session_id, params, query_text, "olympiad")
+
     if not all_required_present:
-        logger.info("Olympiad slot filling in progress")
+        logger.info(f"Olympiad slot filling step {sd['step']}")
         return jsonify({"fulfillmentText": ""})
 
-    name = get_param(params, "any")
+    # Используем сохранённые данные
+    name = sd.get("name") or get_param(params, "any")
     subject = get_param(params, "subject")
     level = get_param(params, "level")
-    start_date = get_param(params, "FROM")
+    start_date = sd.get("date") or get_param(params, "FROM")
     end_date = get_param(params, "to")
 
     start_dt = parse_date_time(start_date, None) if start_date else None
     end_dt = parse_date_time(end_date, None) if end_date else None
 
     # Fallback: парсим из текста
-    p_name, p_start, p_end, p_subj, p_lvl = parse_olympiad_from_text(query_text)
-    if p_name and not name: name = p_name
-    if p_start and not start_dt: start_dt = p_start
-    if p_end and not end_dt: end_dt = p_end
-    if p_subj and not subject: subject = p_subj
-    if p_lvl and not level: level = p_lvl
+    if not name or not start_dt or not end_dt or not subject or not level:
+        p_name, p_start, p_end, p_subj, p_lvl = parse_olympiad_from_text(query_text)
+        if p_name and not name: name = p_name
+        if p_start and not start_dt: start_dt = p_start
+        if p_end and not end_dt: end_dt = p_end
+        if p_subj and not subject: subject = p_subj
+        if p_lvl and not level: level = p_lvl
 
     if start_dt and start_dt.hour == 0 and start_dt.minute == 0:
         start_dt = start_dt.replace(hour=9, minute=0)
@@ -634,7 +648,7 @@ def handle_olympiad(params, query_text, chat_id, all_required_present):
         if not subject: missing.append("предмет")
         if not level: missing.append("уровень")
 
-        logger.info(f"Olympiad missing: {missing}")
+        reset_session_data(session_id)
         return jsonify({"fulfillmentText": f"Укажите {', '.join(missing)} олимпиады."})
 
     job_ids = schedule_reminders(chat_id, "olympiad", name, start_dt, end_dt, subject, level)
@@ -657,6 +671,7 @@ def handle_olympiad(params, query_text, chat_id, all_required_present):
     logger.info(f"Olympiad created: {response_text}")
 
     send_telegram_message(chat_id, f"✅ {response_text}")
+    reset_session_data(session_id)
 
     return jsonify({"fulfillmentText": ""})
 
@@ -734,7 +749,6 @@ def handle_list(chat_id):
     return jsonify({"fulfillmentText": ""})
 
 def handle_clear_all(chat_id):
-    """Удаляет ВСЕ события пользователя."""
     global events
     user_events = [e for e in events if e["chat_id"] == chat_id]
 
